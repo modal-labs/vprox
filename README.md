@@ -1,5 +1,7 @@
 # vprox
 
+**WARNING:** This is unfinished.
+
 vprox is a high-performance network proxy acting as a VPN server. The server accepts peering requests from clients, which then establish WireGuard tunnels that direct all traffic on the client's network interface through the server, with IP masquerading.
 
 Both the client and server commands need root access. The server can have multiple public IP addresses attached, and on cloud providers, it automatically uses the instance metadata endpoint to discover its public IP addresses and start one proxy for each.
