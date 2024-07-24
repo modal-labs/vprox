@@ -10,7 +10,7 @@ This property allows the server to be high-availability. In the event of a resta
 
 ## Usage
 
-By default, `vprox` uses the `fc00:efe7:e682:cf06::/64` subnet for WireGuard tunnels. This subnet has no particular meaning and was randomly chosen. Each network interface and peer gets a random IP address from this subnet, and the risk of collision is low.
+By default, `vprox` uses the `fd30:efe7:e682:cf06::/64` subnet for WireGuard tunnels. This subnet has no particular meaning and was randomly chosen. Each network interface and peer gets a random IP address from this subnet, and the risk of collision is low.
 
 ```bash
 # [Machine A: 1.2.3.4]
