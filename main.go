@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/fatih/color"
@@ -27,8 +28,9 @@ func init() {
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		color.New(color.FgRed).Add(color.Bold).Print("error: ")
-		color.Red(err.Error())
+		fmt.Printf("%s %s\n",
+			color.New(color.FgRed, color.Bold).Sprint("error:"),
+			color.RedString("%v", err))
 		os.Exit(1)
 	}
 }

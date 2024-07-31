@@ -1,0 +1,1 @@
+This directory contains a self-signed X.509 certificate and key file used by the vprox server for TLS if no certificate is specified. This does not guarantee host authenticity, but it can be used to encrypt control traffic via HTTPS.
