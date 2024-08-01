@@ -61,7 +61,6 @@ func (srv *Server) listenForHttps(ctx context.Context, bindAddr net.IP) error {
 	}
 
 	httpServer := &http.Server{
-		Addr:    ":443",
 		Handler: mux,
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
