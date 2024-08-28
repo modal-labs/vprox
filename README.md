@@ -12,8 +12,6 @@ This property allows the server to be high-availability. In the event of a resta
 
 To set up `vprox`, you'll need the private IPv4 address of the server connected to an Internet gateway (use the `ip addr` command), as well as a block of IPs to allocate to the WireGuard subnet between server and client. This has no particular meaning and can be arbitrarily chosen to not overlap with other subnets.
 
-You'll also need to configure a "host suffix" for TLS authentication. This is a unique identifier 
-
 ```bash
 # [Machine A: public IP 1.2.3.4, private IP 172.31.64.125]
 VPROX_PASSWORD=my-password vprox server --ip 172.31.64.125 --wg-block 240.1.0.0/16
@@ -24,7 +22,7 @@ curl ifconfig.me                     # => 5.6.7.8
 curl --interface vprox0 ifconfig.me  # => 1.2.3.4
 ```
 
-Note that Machine B must be able to send UDP packets to port 51820 on Machine A, and TCP to port 443.
+Note that Machine B must be able to send UDP packets to port 50227 on Machine A, and TCP to port 443.
 
 All outbound network traffic seen by `vprox0` will automatically be forwarded through the WireGuard tunnel. The VPN server masquerades the source IP address.
 
