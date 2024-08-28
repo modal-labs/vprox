@@ -151,7 +151,16 @@ func (srv *Server) startWireguard() error {
 		return fmt.Errorf("failed to create WireGuard device: %v", err)
 	}
 
-	// TODO: `ip addr add`
+	gatewayIP := net.IPv4(1, 2, 3, 4) // TODO
+	err = netlink.AddrAdd(link, &netlink.Addr{
+		IPNet: &net.IPNet{
+			IP:   gatewayIP,
+			Mask: net.CIDRMask(24, 32), // TODO
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to add address to WireGuard device: %v", err)
+	}
 
 	listenPort := WireguardListenPort
 	firewallMark := FwmarkBase + int(srv.Index)
@@ -191,7 +200,17 @@ func (srv *Server) startIptables() error {
 }
 
 func (srv *Server) cleanupIptables() {
-	// TODO
+	ipt, err := iptables.New(iptables.IPFamily(iptables.ProtocolIPv4), iptables.Timeout(5))
+	if err != nil {
+		log.Printf("failed to initialize iptables: %v", err)
+		return
+	}
+
+	firewallMark := FwmarkBase + int(srv.Index)
+	ipt.Delete("nat", "POSTROUTING",
+		"-m", "mark", "--mark", strconv.Itoa(firewallMark),
+		"-j", "SNAT", "--to-source", srv.BindAddr.String(),
+		"--comment", fmt.Sprintf("snat rule for %s", srv.Ifname()))
 }
 
 func (srv *Server) listenForHttps() error {
