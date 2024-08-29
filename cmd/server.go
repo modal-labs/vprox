@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
@@ -80,9 +79,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load server key: %v", err)
 	}
 
-	password := os.Getenv("VPROX_PASSWORD")
-	if password == "" {
-		return errors.New("VPROX_PASSWORD environment variable is not set")
+	password, err := lib.GetVproxPassword()
+	if err != nil {
+		return err
 	}
 
 	// Make a shared WireGuard client.

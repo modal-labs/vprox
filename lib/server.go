@@ -59,6 +59,14 @@ func (srv *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type connectRequest struct {
+	PeerPublicKey string
+}
+type connectResponse struct {
+	AssignedAddr    string
+	ServerPublicKey string
+}
+
 // Handle a new connection.
 func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -78,15 +86,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type ConnectRequest struct {
-		PeerPublicKey string
-	}
-	type ConnectResponse struct {
-		AssignedAddr    string
-		ServerPublicKey string
-	}
-
-	req := &ConnectRequest{}
+	req := &connectRequest{}
 	if err = json.Unmarshal(buf, req); err != nil {
 		http.Error(w, "failed to parse request body", http.StatusBadRequest)
 		return
@@ -113,7 +113,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Return the assigned IP address and the server's public key.
-	resp := &ConnectResponse{
+	resp := &connectResponse{
 		AssignedAddr:    "10.0.0.24/8",
 		ServerPublicKey: srv.Key.PublicKey().String(),
 	}
@@ -145,7 +145,14 @@ func (srv *Server) StartWireguard() error {
 		IPNet: srv.WgCidr,
 	})
 	if err != nil {
+		netlink.LinkDel(link)
 		return fmt.Errorf("failed to add address to WireGuard device: %v", err)
+	}
+
+	err = netlink.LinkSetUp(link)
+	if err != nil {
+		netlink.LinkDel(link)
+		return fmt.Errorf("failed to bring up WireGuard device: %v", err)
 	}
 
 	listenPort := WireguardListenPort
@@ -156,6 +163,7 @@ func (srv *Server) StartWireguard() error {
 		FirewallMark: &firewallMark,
 	})
 	if err != nil {
+		netlink.LinkDel(link)
 		return err
 	}
 
