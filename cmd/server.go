@@ -57,6 +57,9 @@ type Server struct {
 	/// WgClient is a shared client for interacting with the WireGuard kernel module.
 	WgClient *wgctrl.Client
 
+	/// WgCidr is the CIDR block of IPs that the server assigns to WireGuard peers.
+	WgCidr *net.IPNet
+
 	/// Ctx is the shutdown context for the server.
 	Ctx context.Context
 }
@@ -114,9 +117,9 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 				PublicKey:         peerKey,
 				ReplaceAllowedIPs: true,
 				AllowedIPs: []net.IPNet{{
-					// TODO: Use correct subnet and return value
-					IP:   net.IPv4(10, 0, 0, 0),
-					Mask: net.CIDRMask(32, 32),
+					// TODO: allocate an IP address from the WgCidr
+					IP:   net.IPv4(240, 0, 0, 3),
+					Mask: srv.WgCidr.Mask,
 				}},
 			},
 		},
@@ -151,12 +154,8 @@ func (srv *Server) startWireguard() error {
 		return fmt.Errorf("failed to create WireGuard device: %v", err)
 	}
 
-	gatewayIP := net.IPv4(1, 2, 3, 4) // TODO
 	err = netlink.AddrAdd(link, &netlink.Addr{
-		IPNet: &net.IPNet{
-			IP:   gatewayIP,
-			Mask: net.CIDRMask(24, 32), // TODO
-		},
+		IPNet: srv.WgCidr,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to add address to WireGuard device: %v", err)
@@ -307,20 +306,76 @@ var ServerCmd = &cobra.Command{
 }
 
 var serverCmdArgs struct {
-	ip []string
+	ip           []string
+	wgBlock      string
+	wgBlockPerIp string
 }
 
 func init() {
 	ServerCmd.Flags().StringArrayVar(&serverCmdArgs.ip, "ip",
 		[]string{}, "IPv4 address to bind to")
+	ServerCmd.Flags().StringVar(&serverCmdArgs.wgBlock, "wg-block",
+		"", "Block of IPs for WireGuard peers, must be unique between servers")
+}
+
+// Increments the given IP address by the given CIDR block size.
+func nextIpBlock(ip net.IP, size uint) net.IP {
+	// Copy the IP address to avoid modifying the original.
+	ipCopy := make(net.IP, len(ip))
+	copy(ipCopy, ip)
+	ip = ipCopy
+
+	bits := 8 * uint(len(ip))
+	if size > bits {
+		log.Panicf("nextIpBlock block size of %v is larger than ip bits %v", size, bits)
+	}
+	for size > 0 {
+		byteIndex := (size - 1) / 8
+		bitIndex := 7 - (size-1)%8
+		ip[byteIndex] ^= 1 << bitIndex
+		if ip[byteIndex]&(1<<bitIndex) > 0 {
+			break
+		}
+		size -= 1
+	}
+	return ip
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
 	if len(serverCmdArgs.ip) == 0 {
-		return errors.New("missing required flag: --ip")
+		return errors.New("missing required flag: -ip")
 	}
 	if len(serverCmdArgs.ip) > 1024 {
-		return errors.New("too many --ip flags")
+		return errors.New("too many -ip flags")
+	}
+	if serverCmdArgs.wgBlock == "" {
+		return errors.New("missing required flag: -wg-block")
+	}
+
+	_, wgBlock, err := net.ParseCIDR(serverCmdArgs.wgBlock)
+	if err != nil {
+		return fmt.Errorf("failed to parse -wg-block: %v", err)
+	}
+	wgBlockSize, _ := wgBlock.Mask.Size()
+	wgBlockPerIp := wgBlockSize
+	if serverCmdArgs.wgBlockPerIp != "" {
+		if serverCmdArgs.wgBlockPerIp[0] != '/' {
+			return errors.New("-wg-block-per-ip must start with '/'")
+		}
+		wgBlockPerIp, err = strconv.Atoi(serverCmdArgs.wgBlockPerIp[1:])
+		if err != nil {
+			return fmt.Errorf("failed to parse -wg-block-per-ip: %v", err)
+		}
+	}
+
+	if wgBlockPerIp > 30 || wgBlockPerIp < wgBlockSize {
+		return fmt.Errorf("invalid value of -wg-block-per-ip: %v", wgBlockPerIp)
+	}
+	wgBlockCount := 1 << (wgBlockPerIp - wgBlockSize)
+	if len(serverCmdArgs.ip) > wgBlockCount {
+		return fmt.Errorf(
+			"not enough IPs in -wg-block for %v -ip flags, please set -wg-block-per-ip",
+			len(serverCmdArgs.ip))
 	}
 
 	key, err := getServerKey()
@@ -348,6 +403,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	defer done()
 	g, ctx := errgroup.WithContext(ctx)
 
+	wgIp := nextIpBlock(wgBlock.IP.To4(), 32) // get the ".1" gateway IP address
 	for i, ipStr := range serverCmdArgs.ip {
 		ip := net.ParseIP(ipStr).To4()
 		if ip == nil {
@@ -360,7 +416,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 		srv.Password = password
 		srv.Index = uint16(i)
 		srv.WgClient = wgClient
+		srv.WgCidr = &net.IPNet{
+			IP:   wgIp,
+			Mask: net.CIDRMask(wgBlockPerIp, 32),
+		}
 		srv.Ctx = ctx
+
+		wgIp = nextIpBlock(wgIp, uint(wgBlockPerIp))
 
 		g.Go(func() error {
 			if err := srv.startWireguard(); err != nil {

@@ -14,10 +14,10 @@ To set up `vprox`, you'll need the private IPv4 address of the server connected 
 
 ```bash
 # [Machine A: public IP 1.2.3.4, private IP 172.31.64.125]
-VPROX_PASSWORD=my-password vprox server --ip 172.31.64.125 --wg-block 240.1.0.0/16
+VPROX_PASSWORD=my-password vprox server -ip 172.31.64.125 -wg-block 240.1.0.0/16
 
 # [Machine B: public IP 5.6.7.8]
-VPROX_PASSWORD=my-password vprox connect 1.2.3.4 --interface vprox0
+VPROX_PASSWORD=my-password vprox connect 1.2.3.4 -interface vprox0
 curl ifconfig.me                     # => 5.6.7.8
 curl --interface vprox0 ifconfig.me  # => 1.2.3.4
 ```
@@ -38,15 +38,15 @@ CGO_ENABLED=0 go build
 
 On cloud providers like AWS, you can attach [secondary private IP addresses](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/MultipleIP.html) to an interface and associate each of them with a global IPv4 unicast address.
 
-A `vprox` server listening on multiple IP addresses needs to provide `--ip` option once for every IP, and each IP requires its its own WireGuard VPN subnet with a non-overlapping address range. You can pass `--wg-block-per-ip /22` to split the `--wg-block` into smaller blocks for each IP.
+A `vprox` server listening on multiple IP addresses needs to provide `-ip` option once for every IP, and each IP requires its its own WireGuard VPN subnet with a non-overlapping address range. You can pass `-wg-block-per-ip /22` to split the `-wg-block` into smaller blocks for each IP.
 
-On AWS in particular, the `--cloud aws` option allows you to automatically discover the private IP addresses of the server by periodically querying the instance metadata endpoint.
+On AWS in particular, the `-cloud aws` option allows you to automatically discover the private IP addresses of the server by periodically querying the instance metadata endpoint.
 
 ## Features
 
 - Works on Linux 5.15+ with WireGuard installed
 - Supports forwarding IPv4 packets
-- Works if the server has multiple IPs, specified with `--wg-block-per-ip`
+- Works if the server has multiple IPs, specified with `-wg-block-per-ip`
 - Automatic discovery of IPs using instance metadata endpoints (AWS)
 - Only one vprox server may be running on a host
 - Control traffic is encrypted with TLS (Warning: does not verify server certificate)
