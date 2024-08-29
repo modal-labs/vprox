@@ -98,14 +98,14 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Add a WireGuard peer for the new connection.
+	peerIp := net.IPv4(240, 0, 0, 3).To4() // TODO: allocate an IP address from the WgCidr
 	srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{
 			{
 				PublicKey:         peerKey,
 				ReplaceAllowedIPs: true,
 				AllowedIPs: []net.IPNet{{
-					// TODO: allocate an IP address from the WgCidr
-					IP:   net.IPv4(240, 0, 0, 3),
+					IP:   peerIp,
 					Mask: net.CIDRMask(32, 32),
 				}},
 			},
@@ -113,8 +113,9 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Return the assigned IP address and the server's public key.
+	cidrSize, _ := srv.WgCidr.Mask.Size()
 	resp := &connectResponse{
-		AssignedAddr:    "240.0.0.3/16", // TODO
+		AssignedAddr:    fmt.Sprintf("%v/%d", peerIp, cidrSize),
 		ServerPublicKey: srv.Key.PublicKey().String(),
 	}
 
