@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,9 @@ import (
 
 // Client manages a peering connection with with a local WireGuard interface.
 type Client struct {
+	// Key is the private key of the client.
+	Key wgtypes.Key
+
 	// Ifname is the name of the client WireGuard interface.
 	Ifname string
 
@@ -37,11 +41,22 @@ func (c *Client) CreateInterface() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse connect URL: %v", err)
 	}
+
+	reqJson := &connectRequest{
+		PeerPublicKey: c.Key.PublicKey().String(),
+	}
+	buf, err := json.Marshal(reqJson)
+	if err != nil {
+		return fmt.Errorf("failed to marshal connect request: %v", err)
+	}
+
 	req := &http.Request{
-		URL: connectUrl,
+		Method: http.MethodPost,
+		URL:    connectUrl,
 		Header: http.Header{
 			"Authorization": []string{"Bearer " + c.Password},
 		},
+		Body: io.NopCloser(bytes.NewBuffer(buf)),
 	}
 
 	resp, err := c.Http.Do(req)
@@ -50,7 +65,11 @@ func (c *Client) CreateInterface() error {
 	}
 	defer resp.Body.Close()
 
-	buf, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned status %v", resp.Status)
+	}
+
+	buf, err = io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %v", err)
 	}
@@ -91,6 +110,8 @@ func (c *Client) CreateInterface() error {
 	// Configure the WireGuard peer.
 	keepalive := 5 * time.Second
 	err = c.WgClient.ConfigureDevice(c.Ifname, wgtypes.Config{
+		PrivateKey:   &c.Key,
+		ReplacePeers: true,
 		Peers: []wgtypes.PeerConfig{
 			{
 				PublicKey: serverPublicKey,

@@ -106,7 +106,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 				AllowedIPs: []net.IPNet{{
 					// TODO: allocate an IP address from the WgCidr
 					IP:   net.IPv4(240, 0, 0, 3),
-					Mask: srv.WgCidr.Mask,
+					Mask: net.CIDRMask(32, 32),
 				}},
 			},
 		},
@@ -114,7 +114,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Return the assigned IP address and the server's public key.
 	resp := &connectResponse{
-		AssignedAddr:    "10.0.0.24/8",
+		AssignedAddr:    "240.0.0.3/16", // TODO
 		ServerPublicKey: srv.Key.PublicKey().String(),
 	}
 
@@ -185,7 +185,7 @@ func (srv *Server) StartIptables() error {
 	err = ipt.AppendUnique("nat", "POSTROUTING",
 		"-m", "mark", "--mark", strconv.Itoa(firewallMark),
 		"-j", "SNAT", "--to-source", srv.BindAddr.String(),
-		"--comment", fmt.Sprintf("snat rule for %s", srv.Ifname()))
+		"-m", "comment", "--comment", fmt.Sprintf("snat rule for %s", srv.Ifname()))
 	if err != nil {
 		return fmt.Errorf("failed to add SNAT rule: %v", err)
 	}
@@ -204,7 +204,7 @@ func (srv *Server) CleanupIptables() {
 	ipt.Delete("nat", "POSTROUTING",
 		"-m", "mark", "--mark", strconv.Itoa(firewallMark),
 		"-j", "SNAT", "--to-source", srv.BindAddr.String(),
-		"--comment", fmt.Sprintf("snat rule for %s", srv.Ifname()))
+		"-m", "comment", "--comment", fmt.Sprintf("snat rule for %s", srv.Ifname()))
 }
 
 func (srv *Server) ListenForHttps() error {

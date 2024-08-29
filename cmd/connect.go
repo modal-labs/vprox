@@ -1,11 +1,14 @@
 package cmd
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/modal-labs/vprox/lib"
@@ -40,6 +43,11 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		return errors.New("only IPv4 addresses are supported")
 	}
 
+	key, err := lib.GetClientKey(connectCmdArgs.ifname)
+	if err != nil {
+		return fmt.Errorf("failed to load server key: %v", err)
+	}
+
 	password, err := lib.GetVproxPassword()
 	if err != nil {
 		return err
@@ -51,6 +59,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}
 
 	client := &lib.Client{
+		Key:      key,
 		Ifname:   connectCmdArgs.ifname,
 		ServerIp: serverIp,
 		Password: password,
@@ -69,8 +78,18 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}
 	defer client.DeleteInterface()
 
+	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer done()
+
+loop:
 	for {
 		fmt.Println("running...")
-		time.Sleep(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			break loop
+		case <-time.After(5 * time.Second):
+		}
 	}
+
+	return nil
 }

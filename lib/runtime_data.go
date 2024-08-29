@@ -15,11 +15,11 @@ func createRunDir() error {
 	return os.MkdirAll(RunDir, 0700)
 }
 
-func GetServerKey() (key wgtypes.Key, err error) {
+func getKeyInternal(name string) (key wgtypes.Key, err error) {
 	if err = createRunDir(); err != nil {
 		return
 	}
-	keyFile := path.Join(RunDir, "server-key")
+	keyFile := path.Join(RunDir, name)
 	contents, err := os.ReadFile(keyFile)
 	if os.IsNotExist(err) {
 		// Generate a private key for the server. This private key will be reused in
@@ -36,4 +36,12 @@ func GetServerKey() (key wgtypes.Key, err error) {
 		return
 	}
 	return wgtypes.ParseKey(strings.TrimSpace(string(contents)))
+}
+
+func GetServerKey() (key wgtypes.Key, err error) {
+	return getKeyInternal("server-key")
+}
+
+func GetClientKey(ifname string) (key wgtypes.Key, err error) {
+	return getKeyInternal("client-key-" + ifname)
 }

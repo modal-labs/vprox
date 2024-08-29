@@ -39,38 +39,38 @@ func init() {
 
 func runServer(cmd *cobra.Command, args []string) error {
 	if len(serverCmdArgs.ip) == 0 {
-		return errors.New("missing required flag: -ip")
+		return errors.New("missing required flag: --ip")
 	}
 	if len(serverCmdArgs.ip) > 1024 {
-		return errors.New("too many -ip flags")
+		return errors.New("too many --ip flags")
 	}
 	if serverCmdArgs.wgBlock == "" {
-		return errors.New("missing required flag: -wg-block")
+		return errors.New("missing required flag: --wg-block")
 	}
 
 	_, wgBlock, err := net.ParseCIDR(serverCmdArgs.wgBlock)
 	if err != nil {
-		return fmt.Errorf("failed to parse -wg-block: %v", err)
+		return fmt.Errorf("failed to parse --wg-block: %v", err)
 	}
 	wgBlockSize, _ := wgBlock.Mask.Size()
 	wgBlockPerIp := wgBlockSize
 	if serverCmdArgs.wgBlockPerIp != "" {
 		if serverCmdArgs.wgBlockPerIp[0] != '/' {
-			return errors.New("-wg-block-per-ip must start with '/'")
+			return errors.New("--wg-block-per-ip must start with '/'")
 		}
 		wgBlockPerIp, err = strconv.Atoi(serverCmdArgs.wgBlockPerIp[1:])
 		if err != nil {
-			return fmt.Errorf("failed to parse -wg-block-per-ip: %v", err)
+			return fmt.Errorf("failed to parse --wg-block-per-ip: %v", err)
 		}
 	}
 
 	if wgBlockPerIp > 30 || wgBlockPerIp < wgBlockSize {
-		return fmt.Errorf("invalid value of -wg-block-per-ip: %v", wgBlockPerIp)
+		return fmt.Errorf("invalid value of --wg-block-per-ip: %v", wgBlockPerIp)
 	}
 	wgBlockCount := 1 << (wgBlockPerIp - wgBlockSize)
 	if len(serverCmdArgs.ip) > wgBlockCount {
 		return fmt.Errorf(
-			"not enough IPs in -wg-block for %v -ip flags, please set -wg-block-per-ip",
+			"not enough IPs in --wg-block for %v -ip flags, please set --wg-block-per-ip",
 			len(serverCmdArgs.ip))
 	}
 
