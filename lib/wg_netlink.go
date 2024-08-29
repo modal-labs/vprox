@@ -4,14 +4,14 @@ package lib
 
 import "github.com/vishvananda/netlink"
 
-type LinkWireguard struct {
+type linkWireguard struct {
 	netlink.LinkAttrs
 }
 
-func (wg *LinkWireguard) Attrs() *netlink.LinkAttrs {
+func (wg *linkWireguard) Attrs() *netlink.LinkAttrs {
 	return &wg.LinkAttrs
 }
 
-func (wg *LinkWireguard) Type() string {
+func (wg *linkWireguard) Type() string {
 	return "wireguard"
 }
