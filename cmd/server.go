@@ -36,6 +36,8 @@ func init() {
 		[]string{}, "IPv4 address to bind to")
 	ServerCmd.Flags().StringVar(&serverCmdArgs.wgBlock, "wg-block",
 		"", "Block of IPs for WireGuard peers, must be unique between servers")
+	ServerCmd.Flags().StringVar(&serverCmdArgs.wgBlockPerIp, "wg-block-per-ip",
+		"", "WireGuard block size for each --ip flag, if multiple are provided")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
