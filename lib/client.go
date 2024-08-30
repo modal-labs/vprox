@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"time"
 
@@ -24,7 +25,7 @@ type Client struct {
 	Ifname string
 
 	// ServerIp is the public IPv4 address of the server.
-	ServerIp net.IP
+	ServerIp netip.Addr
 
 	// Password is authenticates the client connection.
 	Password string
@@ -77,7 +78,7 @@ func (c *Client) CreateInterface() error {
 	var respJson connectResponse
 	json.Unmarshal(buf, &respJson)
 
-	ip, cidr, err := net.ParseCIDR(respJson.AssignedAddr)
+	cidr, err := netip.ParsePrefix(respJson.AssignedAddr)
 	if err != nil {
 		return fmt.Errorf("failed to parse assigned address %v: %v", respJson.AssignedAddr, err)
 	}
@@ -95,7 +96,8 @@ func (c *Client) CreateInterface() error {
 	}
 
 	// Configure the WireGuard interface.
-	err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: cidr.Mask}})
+	ipnet := prefixToIPNet(cidr)
+	err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipnet})
 	if err != nil {
 		netlink.LinkDel(link)
 		return fmt.Errorf("error adding IP to vprox interface: %v", err)
@@ -116,7 +118,7 @@ func (c *Client) CreateInterface() error {
 			{
 				PublicKey: serverPublicKey,
 				Endpoint: &net.UDPAddr{
-					IP:   c.ServerIp,
+					IP:   addrToIp(c.ServerIp),
 					Port: WireguardListenPort,
 				},
 				PersistentKeepaliveInterval: &keepalive,

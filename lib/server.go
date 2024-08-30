@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -33,7 +34,7 @@ type Server struct {
 	Key wgtypes.Key
 
 	// BindAddr is the private IPv4 address that the server binds to.
-	BindAddr net.IP
+	BindAddr netip.Addr
 
 	// Password is needed to authenticate connection requests.
 	Password string
@@ -48,7 +49,7 @@ type Server struct {
 	WgClient *wgctrl.Client
 
 	// WgCidr is the CIDR block of IPs that the server assigns to WireGuard peers.
-	WgCidr *net.IPNet
+	WgCidr netip.Prefix
 
 	// Ctx is the shutdown context for the server.
 	Ctx context.Context
@@ -101,24 +102,20 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Add a WireGuard peer for the new connection.
-	peerIp := net.IPv4(240, 0, 0, 3).To4() // TODO: allocate an IP address from the WgCidr
+	peerIp := netip.AddrFrom4([4]byte{240, 0, 0, 3}) // TODO: allocate an IP address from the WgCidr
 	srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{
 			{
 				PublicKey:         peerKey,
 				ReplaceAllowedIPs: true,
-				AllowedIPs: []net.IPNet{{
-					IP:   peerIp,
-					Mask: net.CIDRMask(32, 32),
-				}},
+				AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
 			},
 		},
 	})
 
 	// Return the assigned IP address and the server's public key.
-	cidrSize, _ := srv.WgCidr.Mask.Size()
 	resp := &connectResponse{
-		AssignedAddr:    fmt.Sprintf("%v/%d", peerIp, cidrSize),
+		AssignedAddr:    fmt.Sprintf("%v/%d", peerIp, srv.WgCidr.Bits()),
 		ServerPublicKey: srv.Key.PublicKey().String(),
 	}
 
@@ -145,9 +142,8 @@ func (srv *Server) StartWireguard() error {
 		return fmt.Errorf("failed to create WireGuard device: %v", err)
 	}
 
-	err = netlink.AddrAdd(link, &netlink.Addr{
-		IPNet: srv.WgCidr,
-	})
+	ipnet := prefixToIPNet(srv.WgCidr)
+	err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipnet})
 	if err != nil {
 		netlink.LinkDel(link)
 		return fmt.Errorf("failed to add address to WireGuard device: %v", err)
@@ -228,7 +224,7 @@ func (srv *Server) CleanupIptables() {
 }
 
 func (srv *Server) ListenForHttps() error {
-	if len(srv.BindAddr) != net.IPv4len {
+	if !srv.BindAddr.Is4() {
 		return fmt.Errorf("invalid IPv4 bind address: %v", srv.BindAddr)
 	}
 

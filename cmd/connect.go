@@ -3,10 +3,9 @@ package cmd
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
-	"net"
 	"net/http"
+	"net/netip"
 	"os/signal"
 	"syscall"
 	"time"
@@ -34,13 +33,9 @@ func init() {
 }
 
 func runConnect(cmd *cobra.Command, args []string) error {
-	serverIp := net.ParseIP(args[0])
-	if serverIp == nil {
-		return errors.New("invalid IP address")
-	}
-	serverIp = serverIp.To4()
-	if serverIp == nil {
-		return errors.New("only IPv4 addresses are supported")
+	serverIp, err := netip.ParseAddr(args[0])
+	if err != nil || !serverIp.Is4() {
+		return fmt.Errorf("invalid IP address %s", args[0])
 	}
 
 	key, err := lib.GetClientKey(connectCmdArgs.ifname)

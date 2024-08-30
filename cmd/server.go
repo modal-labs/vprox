@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
+	"net/netip"
 	"os/signal"
 	"strconv"
 	"syscall"
@@ -49,12 +49,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return errors.New("missing required flag: --wg-block")
 	}
 
-	_, wgBlock, err := net.ParseCIDR(serverCmdArgs.wgBlock)
-	if err != nil {
-		return fmt.Errorf("failed to parse --wg-block: %v", err)
+	wgBlock, err := netip.ParsePrefix(serverCmdArgs.wgBlock)
+	if err != nil || !wgBlock.Addr().Is4() {
+		return fmt.Errorf("failed to parse --wg-block: %s", serverCmdArgs.wgBlock)
 	}
-	wgBlockSize, _ := wgBlock.Mask.Size()
-	wgBlockPerIp := wgBlockSize
+	wgBlock = wgBlock.Masked()
+
+	wgBlockPerIp := wgBlock.Bits()
 	if serverCmdArgs.wgBlockPerIp != "" {
 		if serverCmdArgs.wgBlockPerIp[0] != '/' {
 			return errors.New("--wg-block-per-ip must start with '/'")
@@ -65,10 +66,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if wgBlockPerIp > 30 || wgBlockPerIp < wgBlockSize {
+	if wgBlockPerIp > 30 || wgBlockPerIp < wgBlock.Bits() {
 		return fmt.Errorf("invalid value of --wg-block-per-ip: %v", wgBlockPerIp)
 	}
-	wgBlockCount := 1 << (wgBlockPerIp - wgBlockSize)
+	wgBlockCount := 1 << (wgBlockPerIp - wgBlock.Bits())
 	if len(serverCmdArgs.ip) > wgBlockCount {
 		return fmt.Errorf(
 			"not enough IPs in --wg-block for %v -ip flags, please set --wg-block-per-ip",
@@ -105,10 +106,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 	defer done()
 	g, ctx := errgroup.WithContext(ctx)
 
-	wgIp := nextIpBlock(wgBlock.IP.To4(), 32) // get the ".1" gateway IP address
+	wgIp := nextIpBlock(wgBlock.Addr(), 32) // get the ".1" gateway IP address
 	for i, ipStr := range serverCmdArgs.ip {
-		ip := net.ParseIP(ipStr).To4()
-		if ip == nil {
+		ip, err := netip.ParseAddr(ipStr)
+		if err != nil || !ip.Is4() {
 			return fmt.Errorf("invalid IPv4 address: %v", ipStr)
 		}
 
@@ -119,11 +120,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 			Index:    uint16(i),
 			Ipt:      ipt,
 			WgClient: wgClient,
-			WgCidr: &net.IPNet{
-				IP:   wgIp,
-				Mask: net.CIDRMask(wgBlockPerIp, 32),
-			},
-			Ctx: ctx,
+			WgCidr:   netip.PrefixFrom(wgIp, wgBlockPerIp),
+			Ctx:      ctx,
 		}
 
 		// Increment wgIp to be the next block.
@@ -155,24 +153,23 @@ func runServer(cmd *cobra.Command, args []string) error {
 }
 
 // Increments the given IP address by the given CIDR block size.
-func nextIpBlock(ip net.IP, size uint) net.IP {
+func nextIpBlock(ip netip.Addr, size uint) netip.Addr {
 	// Copy the IP address to avoid modifying the original.
-	ipCopy := make(net.IP, len(ip))
-	copy(ipCopy, ip)
-	ip = ipCopy
+	ipBytes := ip.As4()
 
-	bits := 8 * uint(len(ip))
+	bits := 8 * uint(len(ipBytes))
 	if size > bits {
 		log.Panicf("nextIpBlock block size of %v is larger than ip bits %v", size, bits)
 	}
 	for size > 0 {
 		byteIndex := (size - 1) / 8
 		bitIndex := 7 - (size-1)%8
-		ip[byteIndex] ^= 1 << bitIndex
-		if ip[byteIndex]&(1<<bitIndex) > 0 {
+		ipBytes[byteIndex] ^= 1 << bitIndex
+		if ipBytes[byteIndex]&(1<<bitIndex) > 0 {
 			break
 		}
 		size -= 1
 	}
-	return ip
+
+	return netip.AddrFrom4(ipBytes)
 }
