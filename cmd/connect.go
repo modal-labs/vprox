@@ -10,9 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/modal-labs/vprox/lib"
 	"github.com/spf13/cobra"
 	"golang.zx2c4.com/wireguard/wgctrl"
+
+	"github.com/modal-labs/vprox/lib"
 )
 
 var ConnectCmd = &cobra.Command{

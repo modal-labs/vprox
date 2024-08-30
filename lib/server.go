@@ -53,6 +53,20 @@ type Server struct {
 
 	// Ctx is the shutdown context for the server.
 	Ctx context.Context
+
+	ipAllocator *IpAllocator
+}
+
+// InitState initializes the private server state.
+func (srv *Server) InitState() error {
+	srv.ipAllocator = NewIpAllocator(srv.WgCidr)
+	// Reserve the first IP address for the server itself.
+	reservedIp := srv.ipAllocator.Allocate()
+	if reservedIp != srv.WgCidr.Addr() {
+		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
+	}
+
+	return nil
 }
 
 func (srv *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
@@ -99,11 +113,33 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	peerKey, err := wgtypes.ParseKey(req.PeerPublicKey)
 	if err != nil {
 		http.Error(w, "invalid peer public key", http.StatusBadRequest)
+		return
+	}
+
+	// If the new connection already exists as a peer, just return that IP.
+	peerIp := netip.AddrFrom4([4]byte{})
+
+	device, err := srv.WgClient.Device(srv.Ifname())
+	if err != nil {
+		http.Error(w, "failed to get WireGuard device", http.StatusInternalServerError)
+	}
+	for _, peer := range device.Peers {
+		if peer.PublicKey == peerKey && len(peer.AllowedIPs) > 0 {
+			peerIp, _ = netip.AddrFromSlice([]byte(peer.AllowedIPs[0].IP.To4()))
+			break
+		}
 	}
 
 	// Add a WireGuard peer for the new connection.
-	peerIp := netip.AddrFrom4([4]byte{240, 0, 0, 3}) // TODO: allocate an IP address from the WgCidr
-	srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
+	if peerIp.IsUnspecified() {
+		peerIp = srv.ipAllocator.Allocate()
+	}
+	if peerIp.IsUnspecified() {
+		log.Printf("no more ip addresses available in %v", srv.WgCidr)
+		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
+		return
+	}
+	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{
 			{
 				PublicKey:         peerKey,
@@ -112,6 +148,12 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	})
+	if err != nil {
+		srv.ipAllocator.Free(peerIp)
+		log.Printf("failed to configure WireGuard peer: %v", err)
+		http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
+		return
+	}
 
 	// Return the assigned IP address and the server's public key.
 	resp := &connectResponse{

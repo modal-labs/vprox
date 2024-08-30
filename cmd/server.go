@@ -123,6 +123,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 			WgCidr:   netip.PrefixFrom(wgIp, wgBlockPerIp),
 			Ctx:      ctx,
 		}
+		if err := srv.InitState(); err != nil {
+			return err
+		}
 
 		// Increment wgIp to be the next block.
 		wgIp = nextIpBlock(wgIp, uint(wgBlockPerIp))
