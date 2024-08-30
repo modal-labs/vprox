@@ -110,7 +110,7 @@ func (c *Client) CreateInterface() error {
 	}
 
 	// Configure the WireGuard peer.
-	keepalive := 5 * time.Second
+	keepalive := 25 * time.Second
 	err = c.WgClient.ConfigureDevice(c.Ifname, wgtypes.Config{
 		PrivateKey:   &c.Key,
 		ReplacePeers: true,

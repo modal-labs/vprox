@@ -12,6 +12,9 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/vishvananda/netlink"
@@ -24,6 +27,18 @@ const FwmarkBase = 0x54437D00
 
 // UDP listen port for WireGuard connections.
 const WireguardListenPort = 50227
+
+// A new peer must connect with a handshake within this time.
+const FirstHandshakeTimeout = 10 * time.Second
+
+// If no handshakes are received in this time, the peer is considered idle and
+// removed from the server's WireGuard interface list.
+//
+// Note that this must be at least 2-3 minutes, since WireGuard sends handshakes
+// interleaved with a data message only when 2-3 minutes have passed since the
+// last successful handshake. This is regardless of the persistent-keepalive
+// setting.
+const PeerIdleTimeout = 5 * time.Minute
 
 // Server handles state for one WireGuard network.
 //
@@ -55,6 +70,9 @@ type Server struct {
 	Ctx context.Context
 
 	ipAllocator *IpAllocator
+
+	mu       sync.Mutex // Protects the fields below.
+	newPeers map[wgtypes.Key]time.Time
 }
 
 // InitState initializes the private server state.
@@ -65,7 +83,7 @@ func (srv *Server) InitState() error {
 	if reservedIp != srv.WgCidr.Addr() {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
-
+	srv.newPeers = make(map[wgtypes.Key]time.Time)
 	return nil
 }
 
@@ -139,6 +157,8 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
 		return
 	}
+	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
+	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
 	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{
 			{
@@ -265,10 +285,76 @@ func (srv *Server) CleanupIptables() {
 	srv.iptablesSnatRule(false)
 }
 
+func (srv *Server) removeIdlePeersLoop() {
+	for {
+		// Wait for up to 5 seconds, or stop when the context is done.
+		select {
+		case <-srv.Ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+
+		if err := srv.removeIdlePeers(); err != nil {
+			log.Printf("error removing idle peers: %v", err)
+		}
+	}
+}
+
+func (srv *Server) removeIdlePeers() error {
+	device, err := srv.WgClient.Device(srv.Ifname())
+	if err != nil {
+		return fmt.Errorf("failed to get WireGuard device: %v", err)
+	}
+
+	// Hold the lock for access to newPeers.
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	// Clean up old entries from newPeers map, which should have connected by now.
+	for key, creationTime := range srv.newPeers {
+		if time.Since(creationTime) > PeerIdleTimeout {
+			delete(srv.newPeers, key)
+		}
+	}
+
+	var removePeers []wgtypes.PeerConfig
+	for _, peer := range device.Peers {
+		var idle bool
+		if peer.LastHandshakeTime.IsZero() {
+			_, isNew := srv.newPeers[peer.PublicKey]
+			idle = !isNew
+		} else {
+			idle = time.Since(peer.LastHandshakeTime) > PeerIdleTimeout
+		}
+
+		if idle {
+			if len(peer.AllowedIPs) > 0 {
+				log.Printf("[%v] removing idle peer at %v: %v",
+					srv.BindAddr, peer.AllowedIPs[0].IP, peer.PublicKey)
+			}
+			removePeers = append(removePeers, wgtypes.PeerConfig{
+				PublicKey: peer.PublicKey,
+				Remove:    true,
+			})
+		}
+	}
+
+	if len(removePeers) > 0 {
+		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removePeers})
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (srv *Server) ListenForHttps() error {
 	if !srv.BindAddr.Is4() {
 		return fmt.Errorf("invalid IPv4 bind address: %v", srv.BindAddr)
 	}
+
+	go srv.removeIdlePeersLoop()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.indexHandler)
