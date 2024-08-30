@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -90,6 +91,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to initialize wgctrl: %v", err)
 	}
 
+	ipt, err := iptables.New(iptables.IPFamily(iptables.ProtocolIPv4), iptables.Timeout(5))
+	if err != nil {
+		return fmt.Errorf("failed to initialize iptables: %v", err)
+	}
+
 	// Display the public key, just for information.
 	fmt.Printf("%s %s\n",
 		color.New(color.Bold).Sprint("server public key:"),
@@ -111,6 +117,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 			BindAddr: ip,
 			Password: password,
 			Index:    uint16(i),
+			Ipt:      ipt,
 			WgClient: wgClient,
 			WgCidr: &net.IPNet{
 				IP:   wgIp,

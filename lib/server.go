@@ -35,19 +35,22 @@ type Server struct {
 	// BindAddr is the private IPv4 address that the server binds to.
 	BindAddr net.IP
 
-	/// Password is needed to authenticate connection requests.
+	// Password is needed to authenticate connection requests.
 	Password string
 
-	/// Index is a unique server index for firewall marks and other uses. It starts at 0.
+	// Index is a unique server index for firewall marks and other uses. It starts at 0.
 	Index uint16
 
-	/// WgClient is a shared client for interacting with the WireGuard kernel module.
+	// Ipt is the iptables client for managing firewall rules.
+	Ipt *iptables.IPTables
+
+	// WgClient is a shared client for interacting with the WireGuard kernel module.
 	WgClient *wgctrl.Client
 
-	/// WgCidr is the CIDR block of IPs that the server assigns to WireGuard peers.
+	// WgCidr is the CIDR block of IPs that the server assigns to WireGuard peers.
 	WgCidr *net.IPNet
 
-	/// Ctx is the shutdown context for the server.
+	// Ctx is the shutdown context for the server.
 	Ctx context.Context
 }
 
@@ -157,11 +160,9 @@ func (srv *Server) StartWireguard() error {
 	}
 
 	listenPort := WireguardListenPort
-	firewallMark := FwmarkBase + int(srv.Index)
 	err = srv.WgClient.ConfigureDevice(ifname, wgtypes.Config{
-		PrivateKey:   &srv.Key,
-		ListenPort:   &listenPort,
-		FirewallMark: &firewallMark,
+		PrivateKey: &srv.Key,
+		ListenPort: &listenPort,
 	})
 	if err != nil {
 		netlink.LinkDel(link)
@@ -176,18 +177,45 @@ func (srv *Server) CleanupWireguard() {
 	_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
 }
 
-func (srv *Server) StartIptables() error {
-	ipt, err := iptables.New(iptables.IPFamily(iptables.ProtocolIPv4), iptables.Timeout(5))
-	if err != nil {
-		return fmt.Errorf("failed to initialize iptables: %v", err)
-	}
-
+// iptablesInputFwmarkRule adds or removes the mangle PREROUTING rule for traffic from WireGuard.
+func (srv *Server) iptablesInputFwmarkRule(enabled bool) error {
 	firewallMark := FwmarkBase + int(srv.Index)
-	err = ipt.AppendUnique("nat", "POSTROUTING",
+	rule := []string{
+		"-i", srv.Ifname(),
+		"-j", "MARK", "--set-mark", strconv.Itoa(firewallMark),
+		"-m", "comment", "--comment", fmt.Sprintf("vprox fwmark rule for %s", srv.Ifname()),
+	}
+	if enabled {
+		return srv.Ipt.AppendUnique("mangle", "PREROUTING", rule...)
+	} else {
+		return srv.Ipt.Delete("mangle", "PREROUTING", rule...)
+	}
+}
+
+// iptablesSnatRule adds or removes the nat POSTROUTING rule for outbound traffic.
+func (srv *Server) iptablesSnatRule(enabled bool) error {
+	firewallMark := FwmarkBase + int(srv.Index)
+	rule := []string{
 		"-m", "mark", "--mark", strconv.Itoa(firewallMark),
 		"-j", "SNAT", "--to-source", srv.BindAddr.String(),
-		"-m", "comment", "--comment", fmt.Sprintf("snat rule for %s", srv.Ifname()))
+		"-m", "comment", "--comment", fmt.Sprintf("vprox snat rule for %s", srv.Ifname()),
+	}
+	if enabled {
+		return srv.Ipt.AppendUnique("nat", "POSTROUTING", rule...)
+	} else {
+		return srv.Ipt.Delete("nat", "POSTROUTING", rule...)
+	}
+}
+
+func (srv *Server) StartIptables() error {
+	err := srv.iptablesInputFwmarkRule(true)
 	if err != nil {
+		return fmt.Errorf("failed to add fwmark rule: %v", err)
+	}
+
+	err = srv.iptablesSnatRule(true)
+	if err != nil {
+		srv.iptablesInputFwmarkRule(false)
 		return fmt.Errorf("failed to add SNAT rule: %v", err)
 	}
 
@@ -195,17 +223,8 @@ func (srv *Server) StartIptables() error {
 }
 
 func (srv *Server) CleanupIptables() {
-	ipt, err := iptables.New(iptables.IPFamily(iptables.ProtocolIPv4), iptables.Timeout(5))
-	if err != nil {
-		log.Printf("failed to initialize iptables: %v", err)
-		return
-	}
-
-	firewallMark := FwmarkBase + int(srv.Index)
-	ipt.Delete("nat", "POSTROUTING",
-		"-m", "mark", "--mark", strconv.Itoa(firewallMark),
-		"-j", "SNAT", "--to-source", srv.BindAddr.String(),
-		"-m", "comment", "--comment", fmt.Sprintf("snat rule for %s", srv.Ifname()))
+	srv.iptablesInputFwmarkRule(false)
+	srv.iptablesSnatRule(false)
 }
 
 func (srv *Server) ListenForHttps() error {
