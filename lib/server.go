@@ -318,6 +318,7 @@ func (srv *Server) removeIdlePeers() error {
 	}
 
 	var removePeers []wgtypes.PeerConfig
+	var removeIps []netip.Addr
 	for _, peer := range device.Peers {
 		var idle bool
 		if peer.LastHandshakeTime.IsZero() {
@@ -329,8 +330,12 @@ func (srv *Server) removeIdlePeers() error {
 
 		if idle {
 			if len(peer.AllowedIPs) > 0 {
-				log.Printf("[%v] removing idle peer at %v: %v",
-					srv.BindAddr, peer.AllowedIPs[0].IP, peer.PublicKey)
+				ipv4 := peer.AllowedIPs[0].IP.To4()
+				if ipv4 != nil {
+					log.Printf("[%v] removing idle peer at %v: %v",
+						srv.BindAddr, ipv4, peer.PublicKey)
+					removeIps = append(removeIps, netip.AddrFrom4([4]byte(ipv4)))
+				}
 			}
 			removePeers = append(removePeers, wgtypes.PeerConfig{
 				PublicKey: peer.PublicKey,
@@ -343,6 +348,9 @@ func (srv *Server) removeIdlePeers() error {
 		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removePeers})
 		if err != nil {
 			return err
+		}
+		for _, ip := range removeIps {
+			srv.ipAllocator.Free(ip)
 		}
 	}
 
