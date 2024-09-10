@@ -10,7 +10,7 @@ This property allows the server to be high-availability. In the event of a resta
 
 ## Usage
 
-On the Linux VPN server, install requirements and enable IPv4 forwarding. On Ubuntu:
+On the Linux VPN server and client, install requirements and enable IPv4 forwarding. On Ubuntu:
 
 ```bash
 sudo apt install iptables wireguard
