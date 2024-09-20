@@ -29,6 +29,7 @@ var serverCmdArgs struct {
 	ip           []string
 	wgBlock      string
 	wgBlockPerIp string
+	cloud        string
 }
 
 func init() {
@@ -38,9 +39,24 @@ func init() {
 		"", "Block of IPs for WireGuard peers, must be unique between servers")
 	ServerCmd.Flags().StringVar(&serverCmdArgs.wgBlockPerIp, "wg-block-per-ip",
 		"", "WireGuard block size for each --ip flag, if multiple are provided")
+	ServerCmd.Flags().StringVar(&serverCmdArgs.cloud, "cloud",
+		"", "Cloud provider for IP metadata (watches for changes)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
+	cloud := serverCmdArgs.cloud
+	if cloud == "aws" {
+		client := lib.NewAwsMetadata()
+		interfaces, err := client.GetAddresses()
+		if err != nil {
+			return fmt.Errorf("failed to get AWS MAC addresses: %v", err)
+		}
+		fmt.Printf("%+v\n", interfaces)
+		return errors.New("todo: unimplemented")
+	} else if cloud != "" {
+		return fmt.Errorf("unknown value of --cloud: %v", cloud)
+	}
+
 	if len(serverCmdArgs.ip) == 0 {
 		return errors.New("missing required flag: --ip")
 	}
@@ -74,7 +90,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	wgBlockCount := 1 << (wgBlockPerIp - wgBlock.Bits())
 	if len(serverCmdArgs.ip) > wgBlockCount {
 		return fmt.Errorf(
-			"not enough IPs in --wg-block for %v -ip flags, please set --wg-block-per-ip",
+			"not enough IPs in --wg-block for %v --ip flags, please set --wg-block-per-ip",
 			len(serverCmdArgs.ip))
 	}
 
