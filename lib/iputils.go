@@ -1,9 +1,12 @@
 package lib
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
+
+	"github.com/vishvananda/netlink"
 )
 
 // prefixToIPNet converts a netip.Prefix to a net.IPNet.
@@ -19,6 +22,23 @@ func prefixToIPNet(prefix netip.Prefix) net.IPNet {
 // addrToIp converts a netip.Addr to a net.IP.
 func addrToIp(addr netip.Addr) net.IP {
 	return net.IP(addr.AsSlice())
+}
+
+// getDefaultInterface returns the default network interface.
+func getDefaultInterface() (netlink.Link, error) {
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list routes: %v", err)
+	}
+
+	for _, route := range routes {
+		if route.Dst == nil || route.Dst.IP.Equal(net.IPv4zero) {
+			// Get the link (network interface) associated with the route
+			return netlink.LinkByIndex(route.LinkIndex)
+		}
+	}
+
+	return nil, fmt.Errorf("failed to find default route")
 }
 
 // IpAllocator is a simple IP address allocator that produces IP addresses

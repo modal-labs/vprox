@@ -25,8 +25,8 @@ import (
 // FwmarkBase is the base value for firewall marks used by vprox.
 const FwmarkBase = 0x54437D00
 
-// UDP listen port for WireGuard connections.
-const WireguardListenPort = 50227
+// UDP listen port base value for WireGuard connections.
+const WireguardListenPortBase = 50227
 
 // A new peer must connect with a handshake within this time.
 const FirstHandshakeTimeout = 10 * time.Second
@@ -50,6 +50,12 @@ type Server struct {
 
 	// BindAddr is the private IPv4 address that the server binds to.
 	BindAddr netip.Addr
+
+	// BindIface is the interface that the address is bound to, and it's also
+	// the interface for outbound VPN traffic after masquerade.
+	//
+	// Currently only setting this to the default interface is supported.
+	BindIface netlink.Link
 
 	// Password is needed to authenticate connection requests.
 	Password string
@@ -77,6 +83,14 @@ type Server struct {
 
 // InitState initializes the private server state.
 func (srv *Server) InitState() error {
+	if srv.BindIface == nil {
+		iface, err := getDefaultInterface()
+		if err != nil {
+			return err
+		}
+		srv.BindIface = iface
+	}
+
 	srv.ipAllocator = NewIpAllocator(srv.WgCidr)
 	// Reserve the first IP address for the server itself.
 	reservedIp := srv.ipAllocator.Allocate()
@@ -99,8 +113,9 @@ type connectRequest struct {
 	PeerPublicKey string
 }
 type connectResponse struct {
-	AssignedAddr    string
-	ServerPublicKey string
+	AssignedAddr     string
+	ServerPublicKey  string
+	ServerListenPort int
 }
 
 // Handle a new connection.
@@ -177,8 +192,9 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Return the assigned IP address and the server's public key.
 	resp := &connectResponse{
-		AssignedAddr:    fmt.Sprintf("%v/%d", peerIp, srv.WgCidr.Bits()),
-		ServerPublicKey: srv.Key.PublicKey().String(),
+		AssignedAddr:     fmt.Sprintf("%v/%d", peerIp, srv.WgCidr.Bits()),
+		ServerPublicKey:  srv.Key.PublicKey().String(),
+		ServerListenPort: WireguardListenPortBase + int(srv.Index),
 	}
 
 	respBuf, err := json.Marshal(resp)
@@ -217,7 +233,7 @@ func (srv *Server) StartWireguard() error {
 		return fmt.Errorf("failed to bring up WireGuard device: %v", err)
 	}
 
-	listenPort := WireguardListenPort
+	listenPort := WireguardListenPortBase + int(srv.Index)
 	err = srv.WgClient.ConfigureDevice(ifname, wgtypes.Config{
 		PrivateKey: &srv.Key,
 		ListenPort: &listenPort,
@@ -357,12 +373,38 @@ func (srv *Server) removeIdlePeers() error {
 	return nil
 }
 
+func (srv *Server) addBindAddrLoop() {
+	for {
+		select {
+		case <-srv.Ctx.Done():
+			return
+		case <-time.After(45 * time.Second):
+		}
+		_ = srv.addBindAddr()
+	}
+}
+
+func (srv *Server) addBindAddr() error {
+	// Add the bind address to the host's network interface.
+	ipnet := prefixToIPNet(netip.PrefixFrom(srv.BindAddr, 32))
+	return netlink.AddrReplace(srv.BindIface, &netlink.Addr{
+		IPNet:       &ipnet,
+		ValidLft:    60, // expiry time in seconds
+		PreferedLft: 60, // expiry time in seconds
+	})
+}
+
 func (srv *Server) ListenForHttps() error {
 	if !srv.BindAddr.Is4() {
 		return fmt.Errorf("invalid IPv4 bind address: %v", srv.BindAddr)
 	}
 
 	go srv.removeIdlePeersLoop()
+
+	// Some bind addresses may not have been added to the network interface. If
+	// that is the case, we need to add it (transiently).
+	_ = srv.addBindAddr()
+	go srv.addBindAddrLoop()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.indexHandler)

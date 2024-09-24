@@ -119,7 +119,7 @@ func (c *Client) CreateInterface() error {
 				PublicKey: serverPublicKey,
 				Endpoint: &net.UDPAddr{
 					IP:   addrToIp(c.ServerIp),
-					Port: WireguardListenPort,
+					Port: respJson.ServerListenPort,
 				},
 				PersistentKeepaliveInterval: &keepalive,
 				ReplaceAllowedIPs:           true,
