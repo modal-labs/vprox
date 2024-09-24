@@ -172,6 +172,12 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
 		return
 	}
+	{
+		// Hold the lock for access to newPeers.
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+		srv.newPeers[peerKey] = time.Now()
+	}
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
 	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
 	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
