@@ -125,11 +125,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 	g, ctx := errgroup.WithContext(ctx)
 
 	wgIp := nextIpBlock(wgBlock.Addr(), 32) // get the ".1" gateway IP address
-	for i, ipStr := range serverCmdArgs.ip {
-		ip, err := netip.ParseAddr(ipStr)
-		if err != nil || !ip.Is4() {
-			return fmt.Errorf("invalid IPv4 address: %v", ipStr)
-		}
+
+	// creates a new server, which is returned along with a context that can be used to cancel it
+	newServer := func(ip netip.Addr, i int) (*lib.Server, context.CancelFunc, error) {
+		subctx, cancel := context.WithCancel(ctx)
+		// todo: start server with initial aws ips, create a data structure to manage wireguard blocks,
+		// cancel servers when aws shuts down
+		// maybe we have a queue or something that is in charge of spawning servers
 
 		srv := &lib.Server{
 			Key:      key,
@@ -139,31 +141,29 @@ func runServer(cmd *cobra.Command, args []string) error {
 			Ipt:      ipt,
 			WgClient: wgClient,
 			WgCidr:   netip.PrefixFrom(wgIp, wgBlockPerIp),
-			Ctx:      ctx,
+			Ctx:      subctx,
 		}
 		if err := srv.InitState(); err != nil {
-			return err
+			return nil, nil, err
 		}
 
 		// Increment wgIp to be the next block.
 		wgIp = nextIpBlock(wgIp, uint(wgBlockPerIp))
 
-		g.Go(func() error {
-			if err := srv.StartWireguard(); err != nil {
-				return fmt.Errorf("failed to start WireGuard: %v", err)
-			}
-			defer srv.CleanupWireguard()
+		return srv, cancel, nil
+	}
 
-			if err := srv.StartIptables(); err != nil {
-				return fmt.Errorf("failed to start iptables: %v", err)
-			}
-			defer srv.CleanupIptables()
+	for i, ipStr := range serverCmdArgs.ip {
+		ip, err := netip.ParseAddr(ipStr)
+		if err != nil || !ip.Is4() {
+			return fmt.Errorf("invalid IPv4 address: %v", ipStr)
+		}
+		srv, cancel, err := newServer(ip, i)
+		if err != nil {
+			return err
+		}
+		startServer(srv, g)
 
-			if err := srv.ListenForHttps(); err != nil {
-				return fmt.Errorf("https server failed: %v", err)
-			}
-			return nil
-		})
 	}
 
 	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
@@ -171,6 +171,26 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// Starts a server in a new goroutine in the given error group.
+func startServer(srv *lib.Server, g *errgroup.Group) func() error {
+	g.Go(func() error {
+		if err := srv.StartWireguard(); err != nil {
+			return fmt.Errorf("failed to start WireGuard: %v", err)
+		}
+		defer srv.CleanupWireguard()
+
+		if err := srv.StartIptables(); err != nil {
+			return fmt.Errorf("failed to start iptables: %v", err)
+		}
+		defer srv.CleanupIptables()
+
+		if err := srv.ListenForHttps(); err != nil {
+			return fmt.Errorf("https server failed: %v", err)
+		}
+		return nil
+	})
 }
 
 // Increments the given IP address by the given CIDR block size.
