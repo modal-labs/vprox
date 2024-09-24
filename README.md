@@ -10,12 +10,14 @@ This property allows the server to be high-availability. In the event of a resta
 
 ## Usage
 
-On the Linux VPN server and client, install requirements and enable IPv4 forwarding. On Ubuntu:
+On the Linux VPN server and client, install requirements and enable IPv4 forwarding. Also make sure that [`rp_filter`](https://sysctl-explorer.net/net/ipv4/rp_filter/) is set to 2, or masqueraded packets may be filtered out. On Ubuntu:
 
 ```bash
 sudo apt install iptables wireguard
 
-sudo sysctl -w net.ipv4.ip_forward=1  # applies until next reboot
+# Applies until next reboot
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo sysctl -w net.ipv4.conf.all.rp_filter=2 
 ```
 
 To set up `vprox`, you'll need the private IPv4 address of the server connected to an Internet gateway (use the `ip addr` command), as well as a block of IPs to allocate to the WireGuard subnet between server and client. This has no particular meaning and can be arbitrarily chosen to not overlap with other subnets.
