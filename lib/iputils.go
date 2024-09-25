@@ -2,6 +2,7 @@ package lib
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"sync"
@@ -100,4 +101,33 @@ func (ipa *IpAllocator) Free(addr netip.Addr) bool {
 		return true
 	}
 	return false
+}
+
+// AfterCountIpBlock returns the result of incrementing an IP address by N CIDR
+// counts.
+func AfterCountIpBlock(ip netip.Addr, size uint, count uint) netip.Addr {
+	// Copy the IP address to avoid modifying the original.
+	ipBytes := ip.As4()
+
+	bits := 8 * uint(len(ipBytes))
+	if size > bits {
+		log.Panicf("block size of %v is larger than ip bits %v", size, bits)
+	}
+
+	// CIDR block size rounded up to the nearest multiple of 8
+	// 32->32, 31->32, 30->32, ..., 25->32, 24->24
+	tSize := 8 * ((size + 7) / 8)
+	tCount := count << (tSize - size)
+	for ; tSize > 0; tSize -= 8 {
+		c := tCount & 0xff // how much to add to the current byte
+		tCount = tCount >> 8
+		// 1.2.3.4/32 (byteIndex = 3) -> 1.2.3.5/32
+		// 1.2.3.4/24 (byteIndex = 2) -> 1.2.4.4/24
+		byteIndex := tSize/8 - 1
+		addWithCarry := uint(ipBytes[byteIndex]) + c
+		ipBytes[byteIndex] = byte(addWithCarry)
+		tCount += addWithCarry >> 8
+	}
+
+	return netip.AddrFrom4(ipBytes)
 }

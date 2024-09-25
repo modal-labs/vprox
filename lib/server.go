@@ -446,6 +446,7 @@ func (srv *Server) ListenForHttps() error {
 
 	select {
 	case <-srv.Ctx.Done():
+		log.Printf("server no longer listening on %v:443\n", srv.BindAddr)
 		return httpServer.Shutdown(srv.Ctx)
 	case err = <-errCh:
 		return err

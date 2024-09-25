@@ -17,7 +17,7 @@ sudo apt install iptables wireguard
 
 # Applies until next reboot
 sudo sysctl -w net.ipv4.ip_forward=1
-sudo sysctl -w net.ipv4.conf.all.rp_filter=2 
+sudo sysctl -w net.ipv4.conf.all.rp_filter=2
 ```
 
 To set up `vprox`, you'll need the private IPv4 address of the server connected to an Internet gateway (use the `ip addr` command), as well as a block of IPs to allocate to the WireGuard subnet between server and client. This has no particular meaning and can be arbitrarily chosen to not overlap with other subnets.

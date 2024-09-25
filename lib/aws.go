@@ -52,7 +52,7 @@ func (am *AwsMetadata) GetAddresses() ([]AwsInterface, error) {
 			return nil, err
 		}
 		publicIps := strings.Split(result, "\n")
-		privateIps := make([]string, len(publicIps))
+		privateIps := make([]string, 0, len(publicIps))
 
 		for _, ip := range publicIps {
 			privateIp, err := am.get(fmt.Sprintf("%s/%s/ipv4-associations/%s", prefix, mac, ip))
