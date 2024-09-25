@@ -2,14 +2,13 @@ package lib
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net/netip"
+	"sync"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/fatih/color"
-	"golang.org/x/sync/errgroup"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -26,7 +25,7 @@ type ServerManager struct {
 	key           wgtypes.Key
 	password      string
 	ctx           context.Context
-	errg          *errgroup.Group
+	waitGroup     *sync.WaitGroup
 	wgBlock       netip.Prefix
 	wgBlockPerIp  uint
 	activeServers map[netip.Addr]ServerInfo
@@ -54,15 +53,13 @@ func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Conte
 		color.New(color.Bold).Sprint("server public key:"),
 		key.PublicKey().String())
 
-	errg, ctx := errgroup.WithContext(ctx)
-
 	sm := new(ServerManager)
 	sm.wgClient = wgClient
 	sm.ipt = ipt
 	sm.key = key
 	sm.password = password
 	sm.ctx = ctx
-	sm.errg = errg
+	sm.waitGroup = new(sync.WaitGroup)
 	sm.wgBlock = wgBlock.Masked()
 	sm.wgBlockPerIp = wgBlockPerIp
 	sm.activeServers = make(map[netip.Addr]ServerInfo)
@@ -94,9 +91,8 @@ func (sm *ServerManager) freeIndex(i uint16) {
 	sm.freeIndices = append(sm.freeIndices, i)
 }
 
-// creates a new server on the specified ip
+// Start creates a new server on the specified ip.
 func (sm *ServerManager) Start(ip netip.Addr) error {
-	log.Printf("start %v", ip)
 	i, err := sm.allocateIndex()
 	if err != nil {
 		return err
@@ -118,43 +114,45 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		sm.freeIndex(i)
 		return err
 	}
-	sm.errg.Go(func() error {
+
+	sm.waitGroup.Add(1)
+	go func() {
+		defer sm.freeIndex(i)
+		defer sm.waitGroup.Done()
+
 		if err := srv.StartWireguard(); err != nil {
-			return fmt.Errorf("failed to start WireGuard: %v", err)
+			log.Printf("failed to start WireGuard for %v: %v", ip, err)
+			return
 		}
 		defer srv.CleanupWireguard()
 
 		if err := srv.StartIptables(); err != nil {
-			return fmt.Errorf("failed to start iptables: %v", err)
+			log.Printf("failed to start iptables for %v: %v", ip, err)
+			return
 		}
 		defer srv.CleanupIptables()
 
 		if err := srv.ListenForHttps(); err != nil {
-			return fmt.Errorf("https server failed: %v", err)
+			log.Printf("https server failed for %v: %v", ip, err)
+			return
 		}
-		return nil
-	})
+	}()
 
-	sm.activeServers[ip] = ServerInfo{
-		i,
-		cancel,
-	}
+	sm.activeServers[ip] = ServerInfo{i, cancel}
 	return nil
 }
 
-func (sm *ServerManager) Wait() error {
-	if err := sm.errg.Wait(); err != nil && !errors.Is(err, context.Canceled) {
-		return err
-	}
-	return nil
+// Wait blocks until the running servers exit.
+func (sm *ServerManager) Wait() {
+	sm.waitGroup.Wait()
 }
 
+// Stop stops the server at the specified ip address
 func (sm *ServerManager) Stop(ip netip.Addr) {
 	server, ok := sm.activeServers[ip]
 	if !ok {
-		log.Printf("tried to stop, no server started at ip %v", ip)
+		log.Printf("tried to stop, but no server started at ip %v", ip)
 		return
 	}
-	sm.freeIndex(server.i)
 	server.cancel()
 }

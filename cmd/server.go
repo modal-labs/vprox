@@ -103,6 +103,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	defer sm.Wait()
 
 	if cloud == "aws" {
 		initialIps, err := pollAws(lib.NewAwsMetadata(), make(ipSet), sm)
@@ -111,13 +112,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}
 		var wg sync.WaitGroup
 		wg.Add(1)
+
 		go func() error {
 			defer wg.Done()
 			return pollAwsLoop(ctx, sm, initialIps)
 		}()
 
 		wg.Wait()
-		return nil
 	} else {
 		for _, ipStr := range serverCmdArgs.ip {
 			ip, err := netip.ParseAddr(ipStr)
@@ -129,8 +130,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 				return err
 			}
 		}
-		return sm.Wait()
 	}
+
+	return nil
 }
 
 type ipSet map[netip.Addr]struct{}
@@ -153,6 +155,7 @@ func parseIpSet(ipStrs []string) (ipSet, error) {
 // server for those IPs.
 func pollAws(awsClient *lib.AwsMetadata, currentIps ipSet, sm *lib.ServerManager) (ipSet, error) {
 	interfaces, err := awsClient.GetAddresses()
+
 	if err != nil {
 		return currentIps, fmt.Errorf("failed to get AWS MAC addresses: %v", err)
 	}
