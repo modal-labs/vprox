@@ -10,11 +10,19 @@ This property allows the server to be high-availability. In the event of a resta
 
 ## Usage
 
-On the Linux VPN server and client, install requirements and enable IPv4 forwarding. Also make sure that [`rp_filter`](https://sysctl-explorer.net/net/ipv4/rp_filter/) is set to 2, or masqueraded packets may be filtered out. On Ubuntu:
+On the Linux VPN server and client, install system requirements (`iptables` and `wireguard`).
 
 ```bash
+# On Ubuntu
 sudo apt install iptables wireguard
 
+# On Fedora
+sudo dnf install iptables wireguard-tools
+```
+
+Also, you need to set some kernel settings with Sysctl. Enable IPv4 forwarding, and make sure that [`rp_filter`](https://sysctl-explorer.net/net/ipv4/rp_filter/) is set to 2, or masqueraded packets may be filtered out. You can edit your OS configuration file to set this persistently, or set it once below.
+
+```bash
 # Applies until next reboot
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo sysctl -w net.ipv4.conf.all.rp_filter=2 
@@ -43,6 +51,8 @@ To build `vprox`, run the following command with Go 1.22+ installed:
 ```bash
 CGO_ENABLED=0 go build
 ```
+
+This produces a static binary in `./vprox`.
 
 ### Multiple private IPs
 
