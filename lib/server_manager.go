@@ -19,6 +19,7 @@ type ServerInfo struct {
 }
 
 // ServerManager handles creating and terminating servers on ips
+// ServerManager is not thread safe for concurrent access.
 type ServerManager struct {
 	wgClient      *wgctrl.Client
 	ipt           *iptables.IPTables
@@ -30,7 +31,7 @@ type ServerManager struct {
 	wgBlockPerIp  uint
 	activeServers map[netip.Addr]ServerInfo
 
-	// freeIndices and nextFreeIndex together track usage of the range 0..numWgBocks
+	// freeIndices and nextFreeIndex together track usage of the range 0..numWgBlocks
 	freeIndices   []uint16 // stack of indices that are free
 	nextFreeIndex uint16   // next free index not in the stack
 }
@@ -99,6 +100,9 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 	}
 	subctx, cancel := context.WithCancel(sm.ctx)
 
+	subnetStart := AfterCountIpBlock(sm.wgBlock.Addr(), sm.wgBlockPerIp, uint(i))
+	wgCidr := netip.PrefixFrom(subnetStart.Next(), int(sm.wgBlockPerIp))
+
 	srv := &Server{
 		Key:      sm.key,
 		BindAddr: ip,
@@ -106,7 +110,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		Index:    i,
 		Ipt:      sm.ipt,
 		WgClient: sm.wgClient,
-		WgCidr:   netip.PrefixFrom(AfterCountIpBlock(sm.wgBlock.Addr().Next(), sm.wgBlockPerIp, uint(i)+1), int(sm.wgBlockPerIp)),
+		WgCidr:   wgCidr,
 		Ctx:      subctx,
 	}
 	if err := srv.InitState(); err != nil {
@@ -117,23 +121,23 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 
 	sm.waitGroup.Add(1)
 	go func() {
-		defer sm.freeIndex(i)
 		defer sm.waitGroup.Done()
+		defer sm.freeIndex(i)
 
 		if err := srv.StartWireguard(); err != nil {
-			log.Printf("failed to start WireGuard for %v: %v", ip, err)
+			log.Printf("[%v] failed to start WireGuard: %v", ip, err)
 			return
 		}
 		defer srv.CleanupWireguard()
 
 		if err := srv.StartIptables(); err != nil {
-			log.Printf("failed to start iptables for %v: %v", ip, err)
+			log.Printf("[%v] failed to start iptables: %v", ip, err)
 			return
 		}
 		defer srv.CleanupIptables()
 
 		if err := srv.ListenForHttps(); err != nil {
-			log.Printf("https server failed for %v: %v", ip, err)
+			log.Printf("[%v] https server failed: %v", ip, err)
 			return
 		}
 	}()
@@ -151,7 +155,7 @@ func (sm *ServerManager) Wait() {
 func (sm *ServerManager) Stop(ip netip.Addr) {
 	server, ok := sm.activeServers[ip]
 	if !ok {
-		log.Printf("tried to stop, but no server started at ip %v", ip)
+		log.Printf("tried to stop, but no server started at %v", ip)
 		return
 	}
 	server.cancel()

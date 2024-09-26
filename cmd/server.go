@@ -7,7 +7,6 @@ import (
 	"net/netip"
 	"os/signal"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
@@ -97,28 +96,23 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer done()
 
 	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, password)
 	if err != nil {
+		done()
 		return err
 	}
+
 	defer sm.Wait()
+	defer done()
 
 	if cloud == "aws" {
 		initialIps, err := pollAws(lib.NewAwsMetadata(), make(ipSet), sm)
 		if err != nil {
 			return err
 		}
-		var wg sync.WaitGroup
-		wg.Add(1)
 
-		go func() error {
-			defer wg.Done()
-			return pollAwsLoop(ctx, sm, initialIps)
-		}()
-
-		wg.Wait()
+		pollAwsLoop(ctx, sm, initialIps)
 	} else {
 		for _, ipStr := range serverCmdArgs.ip {
 			ip, err := netip.ParseAddr(ipStr)
@@ -183,7 +177,9 @@ func pollAws(awsClient *lib.AwsMetadata, currentIps ipSet, sm *lib.ServerManager
 	return currentIps, nil
 }
 
-func pollAwsLoop(ctx context.Context, sm *lib.ServerManager, initialIps ipSet) error {
+// pollAwsLoop polls AWS in a blocking loop on an interval of AWS_POLL_DURATION
+// until ctx is done.
+func pollAwsLoop(ctx context.Context, sm *lib.ServerManager, initialIps ipSet) {
 	currentIps := initialIps
 	awsClient := lib.NewAwsMetadata()
 	ticker := time.NewTicker(AWS_POLL_DURATION)
@@ -191,7 +187,7 @@ func pollAwsLoop(ctx context.Context, sm *lib.ServerManager, initialIps ipSet) e
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-ticker.C:
 			var err error
 			currentIps, err = pollAws(awsClient, currentIps, sm)

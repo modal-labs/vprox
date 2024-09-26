@@ -303,8 +303,12 @@ func (srv *Server) StartIptables() error {
 }
 
 func (srv *Server) CleanupIptables() {
-	srv.iptablesInputFwmarkRule(false)
-	srv.iptablesSnatRule(false)
+	if err := srv.iptablesInputFwmarkRule(false); err != nil {
+		log.Printf("warning: error cleaning up IP tables: failed to add fwmark rule: %v\n", err)
+	}
+	if err := srv.iptablesSnatRule(false); err != nil {
+		log.Printf("warning: error cleaning up IP tables: failed to add SNAT rule: %v\n", err)
+	}
 }
 
 func (srv *Server) removeIdlePeersLoop() {
