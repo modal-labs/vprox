@@ -15,7 +15,7 @@ import (
 	"github.com/modal-labs/vprox/lib"
 )
 
-var AWS_POLL_DURATION = 5000 * time.Millisecond // AWS is polled this frequently for new IPs
+var AWS_POLL_DURATION = 5 * time.Second // AWS is polled this frequently for new IPs
 
 var ServerCmd = &cobra.Command{
 	Use:   "server",
