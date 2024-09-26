@@ -4,20 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net/netip"
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
-	"github.com/coreos/go-iptables/iptables"
-	"github.com/fatih/color"
 	"github.com/spf13/cobra"
-	"golang.org/x/sync/errgroup"
-	"golang.zx2c4.com/wireguard/wgctrl"
 
 	"github.com/modal-labs/vprox/lib"
 )
+
+var AWS_POLL_DURATION = 5000 * time.Millisecond // AWS is polled this frequently for new IPs
 
 var ServerCmd = &cobra.Command{
 	Use:   "server",
@@ -45,19 +43,11 @@ func init() {
 
 func runServer(cmd *cobra.Command, args []string) error {
 	cloud := serverCmdArgs.cloud
-	if cloud == "aws" {
-		client := lib.NewAwsMetadata()
-		interfaces, err := client.GetAddresses()
-		if err != nil {
-			return fmt.Errorf("failed to get AWS MAC addresses: %v", err)
-		}
-		fmt.Printf("%+v\n", interfaces)
-		return errors.New("todo: unimplemented")
-	} else if cloud != "" {
+	if cloud != "" && cloud != "aws" {
 		return fmt.Errorf("unknown value of --cloud: %v", cloud)
 	}
 
-	if len(serverCmdArgs.ip) == 0 {
+	if cloud == "" && len(serverCmdArgs.ip) == 0 {
 		return errors.New("missing required flag: --ip")
 	}
 	if len(serverCmdArgs.ip) > 1024 {
@@ -73,21 +63,22 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 	wgBlock = wgBlock.Masked()
 
-	wgBlockPerIp := wgBlock.Bits()
+	wgBlockPerIp := uint(wgBlock.Bits())
 	if serverCmdArgs.wgBlockPerIp != "" {
 		if serverCmdArgs.wgBlockPerIp[0] != '/' {
 			return errors.New("--wg-block-per-ip must start with '/'")
 		}
-		wgBlockPerIp, err = strconv.Atoi(serverCmdArgs.wgBlockPerIp[1:])
+		parsedUint, err := strconv.ParseUint(serverCmdArgs.wgBlockPerIp[1:], 10, 0)
 		if err != nil {
 			return fmt.Errorf("failed to parse --wg-block-per-ip: %v", err)
 		}
+		wgBlockPerIp = uint(parsedUint)
 	}
 
-	if wgBlockPerIp > 30 || wgBlockPerIp < wgBlock.Bits() {
+	if wgBlockPerIp > 30 || wgBlockPerIp < uint(wgBlock.Bits()) {
 		return fmt.Errorf("invalid value of --wg-block-per-ip: %v", wgBlockPerIp)
 	}
-	wgBlockCount := 1 << (wgBlockPerIp - wgBlock.Bits())
+	wgBlockCount := 1 << (wgBlockPerIp - uint(wgBlock.Bits()))
 	if len(serverCmdArgs.ip) > wgBlockCount {
 		return fmt.Errorf(
 			"not enough IPs in --wg-block for %v --ip flags, please set --wg-block-per-ip",
@@ -104,93 +95,105 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Make a shared WireGuard client.
-	wgClient, err := wgctrl.New()
-	if err != nil {
-		return fmt.Errorf("failed to initialize wgctrl: %v", err)
-	}
-
-	ipt, err := iptables.New(iptables.IPFamily(iptables.ProtocolIPv4), iptables.Timeout(5))
-	if err != nil {
-		return fmt.Errorf("failed to initialize iptables: %v", err)
-	}
-
-	// Display the public key, just for information.
-	fmt.Printf("%s %s\n",
-		color.New(color.Bold).Sprint("server public key:"),
-		key.PublicKey().String())
-
 	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+
+	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, password)
+	if err != nil {
+		done()
+		return err
+	}
+
+	defer sm.Wait()
 	defer done()
-	g, ctx := errgroup.WithContext(ctx)
 
-	wgIp := nextIpBlock(wgBlock.Addr(), 32) // get the ".1" gateway IP address
-	for i, ipStr := range serverCmdArgs.ip {
-		ip, err := netip.ParseAddr(ipStr)
-		if err != nil || !ip.Is4() {
-			return fmt.Errorf("invalid IPv4 address: %v", ipStr)
-		}
-
-		srv := &lib.Server{
-			Key:      key,
-			BindAddr: ip,
-			Password: password,
-			Index:    uint16(i),
-			Ipt:      ipt,
-			WgClient: wgClient,
-			WgCidr:   netip.PrefixFrom(wgIp, wgBlockPerIp),
-			Ctx:      ctx,
-		}
-		if err := srv.InitState(); err != nil {
+	if cloud == "aws" {
+		initialIps, err := pollAws(lib.NewAwsMetadata(), make(ipSet), sm)
+		if err != nil {
 			return err
 		}
 
-		// Increment wgIp to be the next block.
-		wgIp = nextIpBlock(wgIp, uint(wgBlockPerIp))
-
-		g.Go(func() error {
-			if err := srv.StartWireguard(); err != nil {
-				return fmt.Errorf("failed to start WireGuard: %v", err)
+		pollAwsLoop(ctx, sm, initialIps)
+	} else {
+		for _, ipStr := range serverCmdArgs.ip {
+			ip, err := netip.ParseAddr(ipStr)
+			if err != nil || !ip.Is4() {
+				return fmt.Errorf("invalid IPv4 address: %q", ipStr)
 			}
-			defer srv.CleanupWireguard()
-
-			if err := srv.StartIptables(); err != nil {
-				return fmt.Errorf("failed to start iptables: %v", err)
+			err = sm.Start(ip)
+			if err != nil {
+				return err
 			}
-			defer srv.CleanupIptables()
-
-			if err := srv.ListenForHttps(); err != nil {
-				return fmt.Errorf("https server failed: %v", err)
-			}
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
-		return err
+		}
 	}
 
 	return nil
 }
 
-// Increments the given IP address by the given CIDR block size.
-func nextIpBlock(ip netip.Addr, size uint) netip.Addr {
-	// Copy the IP address to avoid modifying the original.
-	ipBytes := ip.As4()
+type ipSet map[netip.Addr]struct{}
 
-	bits := 8 * uint(len(ipBytes))
-	if size > bits {
-		log.Panicf("nextIpBlock block size of %v is larger than ip bits %v", size, bits)
-	}
-	for size > 0 {
-		byteIndex := (size - 1) / 8
-		bitIndex := 7 - (size-1)%8
-		ipBytes[byteIndex] ^= 1 << bitIndex
-		if ipBytes[byteIndex]&(1<<bitIndex) > 0 {
-			break
+// parseIpSet parses the provided ipStrs and creates a map with
+// the parsed IPs that can be used as a set.
+func parseIpSet(ipStrs []string) (ipSet, error) {
+	m := make(ipSet)
+	for _, ipStr := range ipStrs {
+		ip, err := netip.ParseAddr(ipStr)
+		if err != nil || !ip.Is4() {
+			return nil, fmt.Errorf("invalid IPv4 address: %v", ipStr)
 		}
-		size -= 1
+		m[ip] = struct{}{}
+	}
+	return m, nil
+}
+
+// pollAws gets the current set of IP associations from AWS and starts/stops the
+// server for those IPs.
+func pollAws(awsClient *lib.AwsMetadata, currentIps ipSet, sm *lib.ServerManager) (ipSet, error) {
+	interfaces, err := awsClient.GetAddresses()
+
+	if err != nil {
+		return currentIps, fmt.Errorf("failed to get AWS MAC addresses: %v", err)
 	}
 
-	return netip.AddrFrom4(ipBytes)
+	newIps, err := parseIpSet(interfaces[0].PrivateIps)
+	if err != nil {
+		return currentIps, err
+	}
+
+	for ip := range currentIps {
+		if _, ok := newIps[ip]; !ok {
+			sm.Stop(ip)
+			delete(currentIps, ip)
+		}
+	}
+
+	for ip := range newIps {
+		if _, ok := currentIps[ip]; !ok {
+			if err := sm.Start(ip); err != nil {
+				return currentIps, fmt.Errorf("error starting new ip: %v", err)
+			}
+			currentIps[ip] = struct{}{}
+		}
+	}
+	return currentIps, nil
+}
+
+// pollAwsLoop polls AWS in a blocking loop on an interval of AWS_POLL_DURATION
+// until ctx is done.
+func pollAwsLoop(ctx context.Context, sm *lib.ServerManager, initialIps ipSet) {
+	currentIps := initialIps
+	awsClient := lib.NewAwsMetadata()
+	ticker := time.NewTicker(AWS_POLL_DURATION)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var err error
+			currentIps, err = pollAws(awsClient, currentIps, sm)
+			if err != nil {
+				fmt.Printf("error during aws poll: %v", err)
+			}
+		}
+	}
 }
