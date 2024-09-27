@@ -76,11 +76,16 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		},
 	}
 
+	err = client.CreateInterface()
+	if err != nil {
+		return err
+	}
+	defer client.DeleteInterface()
+
 	err = client.Connect()
 	if err != nil {
 		return err
 	}
-	defer client.Disconnect()
 
 	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer done()
@@ -105,7 +110,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		unhealthy_loop:
 			for {
 				// currently in an unhealthy state
-				err = client.Reconnect()
+				err = client.Connect()
 				if err == nil {
 					log.Println("Reconnected...")
 					break unhealthy_loop

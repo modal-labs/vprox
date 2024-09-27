@@ -15,7 +15,7 @@ import (
 	"github.com/modal-labs/vprox/lib"
 )
 
-var AWS_POLL_DURATION = 5 * time.Second // AWS is polled this frequently for new IPs
+const awsPollDuration = 5 * time.Second // AWS is polled this frequently for new IPs
 
 var ServerCmd = &cobra.Command{
 	Use:   "server",
@@ -182,7 +182,7 @@ func pollAws(awsClient *lib.AwsMetadata, currentIps ipSet, sm *lib.ServerManager
 func pollAwsLoop(ctx context.Context, sm *lib.ServerManager, initialIps ipSet) {
 	currentIps := initialIps
 	awsClient := lib.NewAwsMetadata()
-	ticker := time.NewTicker(AWS_POLL_DURATION)
+	ticker := time.NewTicker(awsPollDuration)
 
 	for {
 		select {

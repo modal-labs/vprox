@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"syscall"
 	"time"
 
 	probing "github.com/prometheus-community/pro-bing"
@@ -43,35 +45,31 @@ type Client struct {
 	wgCidr netip.Prefix
 }
 
-// Connect attempts to set up the connection with the peer and create a network
-// interface for it. Disconnect() needs to be called when the connection is no
-// longer needed to clean up the created network interface.
-func (c *Client) Connect() error {
-	connectionResponse, err := c.sendConnectionRequest()
-	if err != nil {
-		return err
-	}
+// CreateInterface creates a new interface for wireguard. DeleteInterface() needs
+// to be called to clean this up.
+func (c *Client) CreateInterface() error {
+	link := c.link()
 
-	err = c.createInterface(connectionResponse)
+	err := netlink.LinkAdd(link)
 	if err != nil {
-		return err
-	}
-
-	err = c.configureWireguard(connectionResponse)
-	if err != nil {
-		netlink.LinkDel(c.link())
-		return fmt.Errorf("error configuring vprox interface: %v", err)
+		return fmt.Errorf("error creating vprox interface: %v", err)
 	}
 
 	return nil
 }
 
-// Connect attempts to reconnect to the peer, reusing the existing network
-// interface.
-func (c *Client) Reconnect() error {
+// Connect attempts to reconnect to the peer. A network interface needs to
+// have already been created with CreateInterface() before calling Connect()
+func (c *Client) Connect() error {
 	resp, err := c.sendConnectionRequest()
 	if err != nil {
 		return err
+	}
+
+	link := c.link()
+	err = netlink.LinkSetUp(link)
+	if err != nil {
+		return fmt.Errorf("error setting up vprox interface: %v", err)
 	}
 
 	err = c.updateInterface(resp)
@@ -84,29 +82,6 @@ func (c *Client) Reconnect() error {
 		return fmt.Errorf("error reconfiguring vprox interface: %v", err)
 	}
 
-	return nil
-}
-
-// createInterface creates a new WireGuard interface.
-func (c *Client) createInterface(connectionResponse connectResponse) error {
-	link := c.link()
-
-	err := netlink.LinkAdd(link)
-	if err != nil {
-		return fmt.Errorf("error creating vprox interface: %v", err)
-	}
-
-	err = c.updateInterface(connectionResponse)
-	if err != nil {
-		netlink.LinkDel(link)
-		return err
-	}
-
-	err = netlink.LinkSetUp(link)
-	if err != nil {
-		netlink.LinkDel(link)
-		return fmt.Errorf("error setting up vprox interface: %v", err)
-	}
 	return nil
 }
 
@@ -123,7 +98,7 @@ func (c *Client) updateInterface(resp connectResponse) error {
 		if c.wgCidr != (netip.Prefix{}) {
 			oldIpnet := prefixToIPNet(c.wgCidr)
 			err = netlink.AddrDel(link, &netlink.Addr{IPNet: &oldIpnet})
-			if err != nil {
+			if err != nil && !errors.Is(err, syscall.EEXIST) && !errors.Is(err, syscall.EADDRNOTAVAIL) {
 				return fmt.Errorf("failed to remove old address from vprox interface: %v", err)
 			}
 		}
@@ -212,7 +187,7 @@ func (c *Client) configureWireguard(connectionResponse connectResponse) error {
 	})
 }
 
-func (c *Client) Disconnect() {
+func (c *Client) DeleteInterface() {
 	// Delete the WireGuard interface.
 	netlink.LinkDel(c.link())
 }
