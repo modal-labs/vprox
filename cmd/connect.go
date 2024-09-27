@@ -17,11 +17,12 @@ import (
 	"github.com/modal-labs/vprox/lib"
 )
 
-var HEALTH_CHECK_INTERVAL = 3 * time.Second // when we're healthy, how frequently do we
-// check if we're healthy? (note that this dosen't include the time spent checking, which is at least 2 seconds)
+// when we're healthy, what is the delay between health checks?
+// (note that this dosen't include the time spent checking)
+const healthCheckInterval = 5 * time.Second
 
-var HEALTH_CHECK_TIMEOUT = 5 * time.Second // how long do we wait before the health check times out?
-var RECONNECT_INTERVAL = 2 * time.Second   // when we're unhealthy, how frequently do we try reconnecting?
+const healthCheckTimeout = 5 * time.Second // how long do we wait before the health check times out?
+const reconnectInterval = 2 * time.Second  // when we're unhealthy, how frequently do we try reconnecting?
 
 var ConnectCmd = &cobra.Command{
 	Use:        "connect [flags] <ip>",
@@ -85,7 +86,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	defer done()
 
 	log.Println("Connected...")
-	if !client.CheckConnection(HEALTH_CHECK_TIMEOUT, ctx) {
+	if !client.CheckConnection(healthCheckTimeout, ctx) {
 		return fmt.Errorf("connection immediately turned bad after connecting: %v", err)
 	}
 
@@ -94,10 +95,10 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(HEALTH_CHECK_INTERVAL):
+		case <-time.After(healthCheckInterval):
 		}
 
-		currentStatus := client.CheckConnection(HEALTH_CHECK_TIMEOUT, ctx)
+		currentStatus := client.CheckConnection(healthCheckTimeout, ctx)
 
 		if !currentStatus {
 			log.Println("No longer connected. Attempting to reconnect...")
@@ -113,7 +114,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 				select {
 				case <-ctx.Done():
 					break unhealthy_loop
-				case <-time.After(RECONNECT_INTERVAL):
+				case <-time.After(reconnectInterval):
 				}
 			}
 		}

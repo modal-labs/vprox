@@ -39,19 +39,13 @@ type Client struct {
 	// Http is used to make connect requests to the server.
 	Http *http.Client
 
-	// serverPublicKey is the public key for the wireguard connection
-	serverPublicKey wgtypes.Key
-
-	// wgLink is the wireguard link
-	wgLink *linkWireguard
-
-	// wgCidr is the current wgCidr used with the wireguard link
+	// wgCidr is the current subnet assigned to the WireGuard interface, if any.
 	wgCidr netip.Prefix
 }
 
-// todo: not sure if this is the right name (because now DeleteInterface dosen't seem so paired with it)
-// Connect attempts to set up the connection with the peer and
-// create a network interface for it.
+// Connect attempts to set up the connection with the peer and create a network
+// interface for it. Disconnect() needs to be called when the connection is no
+// longer needed to clean up the created network interface.
 func (c *Client) Connect() error {
 	connectionResponse, err := c.sendConnectionRequest()
 	if err != nil {
@@ -65,7 +59,7 @@ func (c *Client) Connect() error {
 
 	err = c.configureWireguard(connectionResponse)
 	if err != nil {
-		netlink.LinkDel(c.wgLink)
+		netlink.LinkDel(c.link())
 		return fmt.Errorf("error configuring vprox interface: %v", err)
 	}
 
@@ -85,13 +79,17 @@ func (c *Client) Reconnect() error {
 		return err
 	}
 
-	return c.configureWireguard(resp)
+	err = c.configureWireguard(resp)
+	if err != nil {
+		return fmt.Errorf("error reconfiguring vprox interface: %v", err)
+	}
+
+	return nil
 }
 
 // createInterface creates a new WireGuard interface.
 func (c *Client) createInterface(connectionResponse connectResponse) error {
 	link := c.link()
-	c.wgLink = link
 
 	err := netlink.LinkAdd(link)
 	if err != nil {
@@ -120,16 +118,18 @@ func (c *Client) updateInterface(resp connectResponse) error {
 	}
 
 	if cidr != c.wgCidr {
+		link := c.link()
+
 		if c.wgCidr != (netip.Prefix{}) {
 			oldIpnet := prefixToIPNet(c.wgCidr)
-			err = netlink.AddrDel(c.wgLink, &netlink.Addr{IPNet: &oldIpnet})
+			err = netlink.AddrDel(link, &netlink.Addr{IPNet: &oldIpnet})
 			if err != nil {
 				return fmt.Errorf("failed to remove old address from vprox interface: %v", err)
 			}
 		}
 
 		ipnet := prefixToIPNet(cidr)
-		err = netlink.AddrAdd(c.wgLink, &netlink.Addr{IPNet: &ipnet})
+		err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipnet})
 		if err != nil {
 			return fmt.Errorf("failed to add new address to vprox interface: %v", err)
 		}
@@ -185,7 +185,7 @@ func (c *Client) sendConnectionRequest() (connectResponse, error) {
 // configureWireguard configures the WireGuard peer.
 func (c *Client) configureWireguard(connectionResponse connectResponse) error {
 	var err error
-	c.serverPublicKey, err = wgtypes.ParseKey(connectionResponse.ServerPublicKey)
+	serverPublicKey, err := wgtypes.ParseKey(connectionResponse.ServerPublicKey)
 	if err != nil {
 		return fmt.Errorf("failed to parse server public key: %v", err)
 	}
@@ -196,7 +196,7 @@ func (c *Client) configureWireguard(connectionResponse connectResponse) error {
 		ReplacePeers: true,
 		Peers: []wgtypes.PeerConfig{
 			{
-				PublicKey: c.serverPublicKey,
+				PublicKey: serverPublicKey,
 				Endpoint: &net.UDPAddr{
 					IP:   addrToIp(c.ServerIp),
 					Port: connectionResponse.ServerListenPort,
@@ -212,7 +212,7 @@ func (c *Client) configureWireguard(connectionResponse connectResponse) error {
 	})
 }
 
-func (c *Client) DeleteInterface() {
+func (c *Client) Disconnect() {
 	// Delete the WireGuard interface.
 	netlink.LinkDel(c.link())
 }
@@ -230,24 +230,11 @@ func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Contex
 		log.Printf("error creating pinger: %v", err)
 		return false
 	}
-	doneCtx, done := context.WithCancel(context.Background())
-	defer done()
-
-	go func() {
-		for {
-			select {
-			case <-cancelCtx.Done():
-				pinger.Stop()
-				return
-			case <-doneCtx.Done():
-				return
-			}
-		}
-	}()
 
 	pinger.Timeout = timeout
 	pinger.Count = 3
-	err = pinger.Run() // Blocks until finished.
+	pinger.Interval = 100 * time.Millisecond
+	err = pinger.RunWithContext(cancelCtx) // Blocks until finished.
 	if err != nil {
 		log.Printf("error running pinger: %v", err)
 		return false
