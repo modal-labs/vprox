@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,7 +11,6 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"syscall"
 	"time"
 
 	probing "github.com/prometheus-community/pro-bing"
@@ -79,7 +77,7 @@ func (c *Client) Connect() error {
 
 	err = c.configureWireguard(resp)
 	if err != nil {
-		return fmt.Errorf("error reconfiguring vprox interface: %v", err)
+		return fmt.Errorf("error configuring wireguard interface: %v", err)
 	}
 
 	return nil
@@ -99,10 +97,8 @@ func (c *Client) updateInterface(resp connectResponse) error {
 			oldIpnet := prefixToIPNet(c.wgCidr)
 			err = netlink.AddrDel(link, &netlink.Addr{IPNet: &oldIpnet})
 
-			// if the error is EEXIST or EADDRNOTAVAIL, then this may actually imply that the state is
-			// out of sync, so instead of exiting we'll try to continue gracefully
-			if err != nil && !errors.Is(err, syscall.EEXIST) && !errors.Is(err, syscall.EADDRNOTAVAIL) {
-				return fmt.Errorf("failed to remove old address from vprox interface: %v", err)
+			if err != nil {
+				log.Printf("warning: failed to remove old address from vprox interface when reconnecting: %v", err)
 			}
 		}
 
@@ -162,7 +158,6 @@ func (c *Client) sendConnectionRequest() (connectResponse, error) {
 
 // configureWireguard configures the WireGuard peer.
 func (c *Client) configureWireguard(connectionResponse connectResponse) error {
-	var err error
 	serverPublicKey, err := wgtypes.ParseKey(connectionResponse.ServerPublicKey)
 	if err != nil {
 		return fmt.Errorf("failed to parse server public key: %v", err)
@@ -200,8 +195,8 @@ func (c *Client) link() *linkWireguard {
 }
 
 // CheckConnection checks the status of the connection with the wireguard peer,
-// and returns true if it is healthy. This sends 3 pings, one second apart each, so
-// this will block for at least 2 seconds.
+// and returns true if it is healthy. This sends 3 pings in succession, and blocks
+// until they receive a response or the timeout passes.
 func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Context) bool {
 	pinger, err := probing.NewPinger(c.wgCidr.Masked().Addr().Next().String())
 	if err != nil {
@@ -211,8 +206,8 @@ func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Contex
 
 	pinger.Timeout = timeout
 	pinger.Count = 3
-	pinger.Interval = 100 * time.Millisecond
-	err = pinger.RunWithContext(cancelCtx) // Blocks until finished.
+	pinger.Interval = 10 * time.Millisecond // Send approximately all at once
+	err = pinger.RunWithContext(cancelCtx)  // Blocks until finished.
 	if err != nil {
 		log.Printf("error running pinger: %v", err)
 		return false

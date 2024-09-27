@@ -19,7 +19,7 @@ import (
 
 // when we're healthy, what is the delay between health checks?
 // (note that this dosen't include the time spent checking)
-const healthCheckInterval = 5 * time.Second
+const healthCheckInterval = 2 * time.Second
 
 const healthCheckTimeout = 5 * time.Second // how long do we wait before the health check times out?
 const reconnectInterval = 2 * time.Second  // when we're unhealthy, how frequently do we try reconnecting?
