@@ -98,6 +98,9 @@ func (c *Client) updateInterface(resp connectResponse) error {
 		if c.wgCidr != (netip.Prefix{}) {
 			oldIpnet := prefixToIPNet(c.wgCidr)
 			err = netlink.AddrDel(link, &netlink.Addr{IPNet: &oldIpnet})
+
+			// if the error is EEXIST or EADDRNOTAVAIL, then this may actually imply that the state is
+			// out of sync, so instead of exiting we'll try to continue gracefully
 			if err != nil && !errors.Is(err, syscall.EEXIST) && !errors.Is(err, syscall.EADDRNOTAVAIL) {
 				return fmt.Errorf("failed to remove old address from vprox interface: %v", err)
 			}
