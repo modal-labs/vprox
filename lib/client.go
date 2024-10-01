@@ -93,7 +93,7 @@ func (c *Client) updateInterface(resp connectResponse) error {
 	if cidr != c.wgCidr {
 		link := c.link()
 
-		if c.wgCidr != (netip.Prefix{}) {
+		if c.wgCidr.IsValid() {
 			oldIpnet := prefixToIPNet(c.wgCidr)
 			err = netlink.AddrDel(link, &netlink.Addr{IPNet: &oldIpnet})
 

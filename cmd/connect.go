@@ -92,7 +92,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	log.Println("Connected...")
 	if !client.CheckConnection(healthCheckTimeout, ctx) {
-		return fmt.Errorf("connection immediately turned bad after connecting: %v", err)
+		return fmt.Errorf("connection failed initial healthcheck after %v", healthCheckTimeout)
 	}
 
 	for {
