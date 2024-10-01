@@ -124,6 +124,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 				return err
 			}
 		}
+		sm.Wait()
 	}
 
 	return nil
