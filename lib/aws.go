@@ -13,7 +13,6 @@ import (
 type AwsInterface struct {
 	MacAddress  string
 	InterfaceId string // eni-[XXXXXXXXXX]
-	PublicIps   []string
 	PrivateIps  []string
 }
 
@@ -47,25 +46,15 @@ func (am *AwsMetadata) GetAddresses() ([]AwsInterface, error) {
 			return nil, err
 		}
 
-		result, err := am.get(fmt.Sprintf("%s/%s/ipv4-associations", prefix, mac))
+		result, err := am.get(fmt.Sprintf("%s/%s/local-ipv4s", prefix, mac))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to get private IPs for MAC %s: %v", mac, err)
 		}
-		publicIps := strings.Split(result, "\n")
-		privateIps := make([]string, 0, len(publicIps))
-
-		for _, ip := range publicIps {
-			privateIp, err := am.get(fmt.Sprintf("%s/%s/ipv4-associations/%s", prefix, mac, ip))
-			if err != nil {
-				return nil, err
-			}
-			privateIps = append(privateIps, privateIp)
-		}
+		privateIps := strings.Split(result, "\n")
 
 		interfaces = append(interfaces, AwsInterface{
 			MacAddress:  mac,
 			InterfaceId: interfaceId,
-			PublicIps:   publicIps,
 			PrivateIps:  privateIps,
 		})
 	}
