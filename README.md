@@ -74,4 +74,5 @@ On AWS in particular, the `--cloud aws` option allows you to automatically disco
 This library is created by the team behind [Modal](https://modal.com/).
 
 - Eric Zhang ([@ekzhang1](https://twitter.com/ekzhang1)) – [Modal](https://modal.com/)
+- Luis Capelo ([@luiscape](https://twitter.com/luiscape)) – [Modal](https://modal.com/)
 - Jeffrey Meng – [Modal](https://modal.com/)
