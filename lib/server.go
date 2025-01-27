@@ -286,6 +286,23 @@ func (srv *Server) iptablesSnatRule(enabled bool) error {
 	}
 }
 
+// iptablesMssRule adds or removes the FORWARD chain rule for TCP MSS adjustment
+func (srv *Server) iptablesMssRule(enabled bool) error {
+	rule := []string{
+		"-p", "tcp",
+		"--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS",
+		"--set-mss", "1160",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox mss rule for %s", srv.Ifname()),
+	}
+
+	if enabled {
+		return srv.Ipt.AppendUnique("filter", "FORWARD", rule...)
+	} else {
+		return srv.Ipt.Delete("filter", "FORWARD", rule...)
+	}
+}
+
 func (srv *Server) StartIptables() error {
 	err := srv.iptablesInputFwmarkRule(true)
 	if err != nil {
@@ -296,6 +313,13 @@ func (srv *Server) StartIptables() error {
 	if err != nil {
 		srv.iptablesInputFwmarkRule(false)
 		return fmt.Errorf("failed to add SNAT rule: %v", err)
+	}
+
+	err = srv.iptablesMssRule(true)
+	if err != nil {
+		srv.iptablesSnatRule(false)
+		srv.iptablesInputFwmarkRule(false)
+		return fmt.Errorf("failed to add MSS rule: %v", err)
 	}
 
 	return nil
