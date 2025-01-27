@@ -317,9 +317,12 @@ func (srv *Server) StartIptables() error {
 
 	err = srv.iptablesMssRule(true)
 	if err != nil {
-		err = srv.iptablesSnatRule(false)
-		srv.iptablesInputFwmarkRule(false)
-		return fmt.Errorf("failed to add MSS rule: %v", err)
+		if err := srv.iptablesSnatRule(false); err != nil {
+			return fmt.Errorf("failed to add MSS rule: %v", err)
+		}
+		if err := srv.iptablesInputFwmarkRule(false); err != nil {
+			return fmt.Errorf("failed to add MSS rule: %v", err)
+		}
 	}
 
 	return nil
