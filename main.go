@@ -24,6 +24,7 @@ func init() {
 	rootCmd.AddCommand(cmd.ListCmd)
 	rootCmd.AddCommand(cmd.ServerCmd)
 	rootCmd.AddCommand(cmd.ConnectCmd)
+	rootCmd.AddCommand(cmd.BenchCmd)
 }
 
 func main() {
