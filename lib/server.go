@@ -155,17 +155,6 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	device, err := srv.WgClient.Device(srv.Ifname())
-	if err != nil {
-		http.Error(w, "failed to get WireGuard device", http.StatusInternalServerError)
-	}
-	for _, peer := range device.Peers {
-		if peer.PublicKey == peerKey && len(peer.AllowedIPs) > 0 {
-			break
-		}
-	}
-
-	// DO_NOT_SUBMIT: Can there be races between this and the GC code?
 	srv.mu.Lock()
 	peerInfo, exists := srv.newPeers[peerKey]
 	srv.mu.Unlock()
