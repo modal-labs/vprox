@@ -40,7 +40,6 @@ const FirstHandshakeTimeout = 10 * time.Second
 // setting.
 const PeerIdleTimeout = 5 * time.Minute
 
-// PeerInfo stores connection metadata for a peer.
 type PeerInfo struct {
 	ConnectionTime time.Time
 	PeerIp         netip.Addr
