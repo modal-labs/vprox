@@ -40,6 +40,12 @@ const FirstHandshakeTimeout = 10 * time.Second
 // setting.
 const PeerIdleTimeout = 5 * time.Minute
 
+// PeerInfo stores connection metadata for a peer.
+type PeerInfo struct {
+	ConnectionTime time.Time
+	PeerIp         netip.Addr
+}
+
 // Server handles state for one WireGuard network.
 //
 // The `vprox server` command should create one Server instance for each
@@ -78,7 +84,7 @@ type Server struct {
 	ipAllocator *IpAllocator
 
 	mu       sync.Mutex // Protects the fields below.
-	newPeers map[wgtypes.Key]time.Time
+	newPeers map[wgtypes.Key]PeerInfo
 }
 
 // InitState initializes the private server state.
@@ -97,7 +103,7 @@ func (srv *Server) InitState() error {
 	if reservedIp != srv.WgCidr.Addr() {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
-	srv.newPeers = make(map[wgtypes.Key]time.Time)
+	srv.newPeers = make(map[wgtypes.Key]PeerInfo)
 	return nil
 }
 
@@ -161,14 +167,13 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 
 	// DO_NOT_SUBMIT: Can there be races between this and the GC code?
 	srv.mu.Lock()
-	lastUsed, exists := srv.newPeers[peerKey]
+	peerInfo, exists := srv.newPeers[peerKey]
 	srv.mu.Unlock()
 
 	// If the new connection already exists as a peer, just return that IP.
 	var peerIp netip.Addr
 	if exists {
-		// DO_NOT_SUBMIT: procure the IP from the table.
-		// peerIp, _ = netip.AddrFromSlice([]byte(peer.AllowedIPs[0].IP.To4()))
+		peerIp = peerInfo.PeerIp
 	} else {
 		// Add a WireGuard peer for the new connection.
 		peerIp = srv.ipAllocator.Allocate()
@@ -199,7 +204,10 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	srv.mu.Lock()
-	srv.newPeers[peerKey] = time.Now()
+	srv.newPeers[peerKey] = PeerInfo{
+		ConnectionTime: time.Now(),
+		PeerIp:         peerIp,
+	}
 	srv.mu.Unlock()
 
 	// Return the assigned IP address and the server's public key.
@@ -367,8 +375,8 @@ func (srv *Server) removeIdlePeers() error {
 	defer srv.mu.Unlock()
 
 	// Clean up old entries from newPeers map, which should have connected by now.
-	for key, creationTime := range srv.newPeers {
-		if time.Since(creationTime) > PeerIdleTimeout {
+	for key, peerInfo := range srv.newPeers {
+		if time.Since(peerInfo.ConnectionTime) > PeerIdleTimeout {
 			delete(srv.newPeers, key)
 		}
 	}
