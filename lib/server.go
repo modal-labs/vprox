@@ -149,33 +149,36 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If the new connection already exists as a peer, just return that IP.
-	peerIp := netip.AddrFrom4([4]byte{})
-
 	device, err := srv.WgClient.Device(srv.Ifname())
 	if err != nil {
 		http.Error(w, "failed to get WireGuard device", http.StatusInternalServerError)
 	}
 	for _, peer := range device.Peers {
 		if peer.PublicKey == peerKey && len(peer.AllowedIPs) > 0 {
-			peerIp, _ = netip.AddrFromSlice([]byte(peer.AllowedIPs[0].IP.To4()))
 			break
 		}
 	}
 
-	// Add a WireGuard peer for the new connection.
-	if peerIp.IsUnspecified() {
+	// DO_NOT_SUBMIT: Can there be races between this and the GC code?
+	srv.mu.Lock()
+	lastUsed, exists := srv.newPeers[peerKey]
+	srv.mu.Unlock()
+
+	// If the new connection already exists as a peer, just return that IP.
+	var peerIp netip.Addr
+	if exists {
+		// DO_NOT_SUBMIT: procure the IP from the table.
+		// peerIp, _ = netip.AddrFromSlice([]byte(peer.AllowedIPs[0].IP.To4()))
+	} else {
+		// Add a WireGuard peer for the new connection.
 		peerIp = srv.ipAllocator.Allocate()
 	}
+
 	if peerIp.IsUnspecified() {
 		log.Printf("no more ip addresses available in %v", srv.WgCidr)
 		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
 		return
 	}
-
-	srv.mu.Lock()
-	srv.newPeers[peerKey] = time.Now()
-	srv.mu.Unlock()
 
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
 	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
@@ -194,6 +197,10 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
 		return
 	}
+
+	srv.mu.Lock()
+	srv.newPeers[peerKey] = time.Now()
+	srv.mu.Unlock()
 
 	// Return the assigned IP address and the server's public key.
 	resp := &connectResponse{
