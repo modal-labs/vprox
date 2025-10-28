@@ -186,12 +186,18 @@ func runParallelConnections(ctx context.Context, serverIp netip.Addr, password s
 		fmt.Printf("Connections/Second:          %.2f\n", float64(successCount)/totalTime.Seconds())
 	}
 
-	// Clean up all successful connections
+	// Clean up all successful connections concurrently
+	var cleanupWg sync.WaitGroup
 	for _, client := range clients {
 		if client != nil {
-			client.DeleteInterface()
+			cleanupWg.Add(1)
+			go func(c *lib.Client) {
+				defer cleanupWg.Done()
+				c.DeleteInterface()
+			}(client)
 		}
 	}
+	cleanupWg.Wait()
 
 	if failedCount > 0 {
 		return fmt.Errorf("%d out of %d connections failed", failedCount, numConnections)
