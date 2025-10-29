@@ -173,6 +173,13 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	srv.mu.Lock()
+	srv.newPeers[peerKey] = PeerInfo{
+		ConnectionTime: time.Now(),
+		PeerIp:         peerIp,
+	}
+	srv.mu.Unlock()
+
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
 	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
 	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
@@ -185,18 +192,15 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 	if err != nil {
+		srv.mu.Lock()
+		delete(srv.newPeers, peerKey)
+		srv.mu.Unlock()
+
 		srv.ipAllocator.Free(peerIp)
 		log.Printf("failed to configure WireGuard peer: %v", err)
 		http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
 		return
 	}
-
-	srv.mu.Lock()
-	srv.newPeers[peerKey] = PeerInfo{
-		ConnectionTime: time.Now(),
-		PeerIp:         peerIp,
-	}
-	srv.mu.Unlock()
 
 	// Return the assigned IP address and the server's public key.
 	resp := &connectResponse{
