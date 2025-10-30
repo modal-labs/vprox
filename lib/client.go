@@ -185,6 +185,46 @@ func (c *Client) configureWireguard(connectionResponse connectResponse) error {
 	})
 }
 
+// Disconnect notifies the server that this client is disconnecting, allowing the
+// server to immediately reclaim resources (wireguard peer and subnet IP) instead of
+// waiting for the idle timeout.
+func (c *Client) Disconnect() error {
+	disconnectUrl, err := url.Parse(fmt.Sprintf("https://%s/disconnect", c.ServerIp))
+	if err != nil {
+		return fmt.Errorf("failed to parse disconnect URL: %v", err)
+	}
+
+	reqJson := &disconnectRequest{
+		PeerPublicKey: c.Key.PublicKey().String(),
+	}
+	buf, err := json.Marshal(reqJson)
+	if err != nil {
+		return fmt.Errorf("failed to marshal disconnect request: %v", err)
+	}
+
+	req := &http.Request{
+		Method: http.MethodPost,
+		URL:    disconnectUrl,
+		Header: http.Header{
+			"Authorization": []string{"Bearer " + c.Password},
+		},
+		Body: io.NopCloser(bytes.NewBuffer(buf)),
+	}
+
+	resp, err := c.Http.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send disconnect request to server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned status %v for disconnect request", resp.Status)
+	}
+
+	log.Printf("successfully disconnected from server %v", c.ServerIp)
+	return nil
+}
+
 func (c *Client) DeleteInterface() {
 	// Delete the WireGuard interface.
 	netlink.LinkDel(c.link())

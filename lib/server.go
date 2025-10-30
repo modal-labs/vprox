@@ -219,6 +219,71 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(respBuf)
 }
 
+type disconnectRequest struct {
+	PeerPublicKey string
+}
+
+type disconnectResponse struct {
+	Status string
+}
+
+// Handle a disconnect request from a client.
+func (srv *Server) disconnectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	auth := r.Header.Get("Authorization")
+	if auth != "Bearer "+srv.Password {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	buf, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	req := &disconnectRequest{}
+	if err = json.Unmarshal(buf, req); err != nil {
+		http.Error(w, "failed to parse request body", http.StatusBadRequest)
+		return
+	}
+
+	peerKey, err := wgtypes.ParseKey(req.PeerPublicKey)
+	if err != nil {
+		http.Error(w, "invalid peer public key", http.StatusBadRequest)
+		return
+	}
+
+	// Clean up the peer (idempotent operation).
+	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
+	log.Printf("[%v] disconnect request from %v: %v", srv.BindAddr, clientIp, peerKey)
+
+	err = srv.cleanupPeer(peerKey)
+	if err != nil {
+		log.Printf("failed to cleanup peer %v: %v", peerKey, err)
+		http.Error(w, "failed to cleanup peer", http.StatusInternalServerError)
+		return
+	}
+
+	// Return success response.
+	resp := &disconnectResponse{
+		Status: "success",
+	}
+
+	respBuf, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, "failed to serialize response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(respBuf)
+}
+
 func (srv *Server) Ifname() string {
 	return fmt.Sprintf("vprox%d", srv.Index)
 }
@@ -356,6 +421,46 @@ func (srv *Server) removeIdlePeersLoop() {
 	}
 }
 
+// cleanupPeer removes a peer from the WireGuard interface, reclaims its subnet IP,
+// and removes it from the newPeers map. This function is idempotent and safe to call
+// even if the peer doesn't exist. It uses the newPeers map as the source of truth.
+func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
+	// Look up the peer in newPeers map to get its IP address.
+	srv.mu.Lock()
+	peerInfo, exists := srv.newPeers[publicKey]
+	if !exists {
+		// Peer not in newPeers - already cleaned up (idempotent).
+		srv.mu.Unlock()
+		return nil
+	}
+
+	// Extract peer info and remove from newPeers.
+	peerIp := peerInfo.PeerIp
+	delete(srv.newPeers, publicKey)
+	srv.mu.Unlock()
+
+	// Remove the peer from WireGuard (no lock held during WireGuard operations).
+	log.Printf("[%v] removing peer at %v: %v", srv.BindAddr, peerIp, publicKey)
+	err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
+		Peers: []wgtypes.PeerConfig{
+			{
+				PublicKey: publicKey,
+				Remove:    true,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to remove WireGuard peer: %v", err)
+	}
+
+	// Free the IP address.
+	if !peerIp.IsUnspecified() {
+		srv.ipAllocator.Free(peerIp)
+	}
+
+	return nil
+}
+
 func (srv *Server) removeIdlePeers() error {
 	device, err := srv.WgClient.Device(srv.Ifname())
 	if err != nil {
@@ -449,6 +554,7 @@ func (srv *Server) ListenForHttps() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.indexHandler)
 	mux.HandleFunc("/connect", srv.connectHandler)
+	mux.HandleFunc("/disconnect", srv.disconnectHandler)
 
 	cert, err := loadServerTls()
 	if err != nil {
