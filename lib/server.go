@@ -423,64 +423,37 @@ func (srv *Server) removeIdlePeersLoop() {
 
 // cleanupPeer removes a peer from the WireGuard interface, reclaims its subnet IP,
 // and removes it from the newPeers map. This function is idempotent and safe to call
-// even if the peer doesn't exist.
+// even if the peer doesn't exist. It uses the newPeers map as the source of truth.
 func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
-	// Get the current WireGuard device state to find the peer's IP.
-	device, err := srv.WgClient.Device(srv.Ifname())
-	if err != nil {
-		return fmt.Errorf("failed to get WireGuard device: %v", err)
-	}
-
-	// Find the peer in the device and get its IP address.
-	var peerIp netip.Addr
-	var peerExists bool
-	for _, peer := range device.Peers {
-		if peer.PublicKey == publicKey {
-			peerExists = true
-			if len(peer.AllowedIPs) > 0 {
-				ipv4 := peer.AllowedIPs[0].IP.To4()
-				if ipv4 != nil {
-					peerIp = netip.AddrFrom4([4]byte(ipv4))
-				}
-			}
-			break
-		}
-	}
-
-	// Remove from newPeers map (lock required).
+	// Look up the peer in newPeers map to get its IP address.
 	srv.mu.Lock()
-	peerInfo, inNewPeers := srv.newPeers[publicKey]
-	if inNewPeers {
-		delete(srv.newPeers, publicKey)
-		// If we didn't find the IP from WireGuard, try to get it from newPeers.
-		if peerIp.IsUnspecified() && !peerInfo.PeerIp.IsUnspecified() {
-			peerIp = peerInfo.PeerIp
-		}
-	}
-	srv.mu.Unlock()
-
-	// If the peer doesn't exist in either place, this is idempotent - just return success.
-	if !peerExists && !inNewPeers {
+	peerInfo, exists := srv.newPeers[publicKey]
+	if !exists {
+		// Peer not in newPeers - already cleaned up (idempotent).
+		srv.mu.Unlock()
 		return nil
 	}
 
-	// Remove the peer from WireGuard if it exists.
-	if peerExists {
-		log.Printf("[%v] removing peer at %v: %v", srv.BindAddr, peerIp, publicKey)
-		err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
-			Peers: []wgtypes.PeerConfig{
-				{
-					PublicKey: publicKey,
-					Remove:    true,
-				},
+	// Extract peer info and remove from newPeers.
+	peerIp := peerInfo.PeerIp
+	delete(srv.newPeers, publicKey)
+	srv.mu.Unlock()
+
+	// Remove the peer from WireGuard (no lock held during WireGuard operations).
+	log.Printf("[%v] removing peer at %v: %v", srv.BindAddr, peerIp, publicKey)
+	err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
+		Peers: []wgtypes.PeerConfig{
+			{
+				PublicKey: publicKey,
+				Remove:    true,
 			},
-		})
-		if err != nil {
-			return fmt.Errorf("failed to remove WireGuard peer: %v", err)
-		}
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to remove WireGuard peer: %v", err)
 	}
 
-	// Free the IP address if we found one.
+	// Free the IP address.
 	if !peerIp.IsUnspecified() {
 		srv.ipAllocator.Free(peerIp)
 	}
