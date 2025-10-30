@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"net/netip"
+	"os"
+	"os/exec"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -34,8 +36,12 @@ var BenchCmd = &cobra.Command{
 	RunE:       runParallelConnect,
 }
 var benchCmdArgs struct {
-	ifname         string
-	numConnections int
+	ifname           string
+	numConnections   int
+	subprocessChurn  bool
+	churnIterations  int
+	churnBatchSize   int
+	churnDelayMs     int
 }
 
 func init() {
@@ -43,6 +49,14 @@ func init() {
 		"vprox-bench-", "Interface name to proxy traffic through the VPN")
 	BenchCmd.Flags().IntVarP(&benchCmdArgs.numConnections, "num-connections", "n",
 		1, "Number of parallel connections to establish for benchmarking")
+	BenchCmd.Flags().BoolVar(&benchCmdArgs.subprocessChurn, "subprocess-churn",
+		false, "Enable subprocess churn testing mode")
+	BenchCmd.Flags().IntVar(&benchCmdArgs.churnIterations, "churn-iterations",
+		2000, "Total number of subprocesses to create in churn test")
+	BenchCmd.Flags().IntVar(&benchCmdArgs.churnBatchSize, "churn-batch-size",
+		20, "Number of concurrent subprocesses per batch in churn test")
+	BenchCmd.Flags().IntVar(&benchCmdArgs.churnDelayMs, "churn-delay-ms",
+		100, "Milliseconds to wait before killing each batch in churn test")
 }
 
 func runParallelConnect(cmd *cobra.Command, args []string) error {
@@ -56,13 +70,18 @@ func runParallelConnect(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer done()
+
+	// Check if subprocess churn mode is enabled
+	if benchCmdArgs.subprocessChurn {
+		return runSubprocessChurn(ctx, serverIp)
+	}
+
 	wgClient, err := wgctrl.New()
 	if err != nil {
 		return fmt.Errorf("failed to initialize wgctrl: %v", err)
 	}
-
-	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer done()
 
 	if benchCmdArgs.numConnections == 1 {
 		// Single connection mode (original behavior)
@@ -71,6 +90,173 @@ func runParallelConnect(cmd *cobra.Command, args []string) error {
 
 	// Benchmark mode with N parallel connections
 	return runParallelConnections(ctx, serverIp, password, wgClient, benchCmdArgs.numConnections)
+}
+
+func runSubprocessChurn(ctx context.Context, serverIp netip.Addr) error {
+	iterations := benchCmdArgs.churnIterations
+	batchSize := benchCmdArgs.churnBatchSize
+	delayMs := benchCmdArgs.churnDelayMs
+
+	numBatches := (iterations + batchSize - 1) / batchSize // Round up division
+
+	log.Printf("Starting subprocess churn test...")
+	log.Printf("  Total subprocesses: %d", iterations)
+	log.Printf("  Batch size: %d", batchSize)
+	log.Printf("  Number of batches: %d", numBatches)
+	log.Printf("  Delay per batch: %dms", delayMs)
+	log.Println()
+
+	var (
+		totalStarted     int
+		totalCleanExits  int
+		totalErrors      int
+		totalKilled      int
+	)
+
+	startTime := time.Now()
+	subprocessIdx := 0
+
+	for batch := 0; batch < numBatches; batch++ {
+		// Calculate how many subprocesses to start in this batch
+		remaining := iterations - subprocessIdx
+		currentBatchSize := batchSize
+		if remaining < batchSize {
+			currentBatchSize = remaining
+		}
+
+		batchStartTime := time.Now()
+
+		// Start concurrent subprocesses
+		type subprocessResult struct {
+			index   int
+			cmd     *exec.Cmd
+			started bool
+			err     error
+		}
+
+		results := make([]subprocessResult, currentBatchSize)
+		var wg sync.WaitGroup
+
+		// Start all subprocesses in this batch concurrently
+		for i := 0; i < currentBatchSize; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+
+				globalIdx := subprocessIdx + idx
+				ifname := fmt.Sprintf("vprox-churn-%d", globalIdx)
+
+				// Get the path to the current vprox binary
+				vproxPath, err := os.Executable()
+				if err != nil {
+					results[idx] = subprocessResult{index: globalIdx, started: false, err: err}
+					return
+				}
+
+				cmd := exec.Command(vproxPath, "connect", "--interface", ifname, serverIp.String())
+				cmd.Stdout = nil
+				cmd.Stderr = nil
+
+				err = cmd.Start()
+				if err != nil {
+					results[idx] = subprocessResult{index: globalIdx, started: false, err: err}
+					return
+				}
+
+				results[idx] = subprocessResult{index: globalIdx, cmd: cmd, started: true, err: nil}
+			}(i)
+		}
+
+		// Wait for all starts to complete
+		wg.Wait()
+
+		// Count successful starts
+		var cmds []*exec.Cmd
+		for _, result := range results {
+			if result.started {
+				totalStarted++
+				cmds = append(cmds, result.cmd)
+			} else {
+				totalErrors++
+				if result.err != nil {
+					log.Printf("  [Batch %d] Failed to start subprocess %d: %v", batch, result.index, result.err)
+				}
+			}
+		}
+
+		// Wait for the configured delay
+		time.Sleep(time.Duration(delayMs) * time.Millisecond)
+
+		// Kill all subprocesses in this batch
+		for i, cmd := range cmds {
+			if cmd != nil && cmd.Process != nil {
+				err := cmd.Process.Signal(syscall.SIGTERM)
+				if err != nil {
+					log.Printf("  [Batch %d] Failed to send SIGTERM to subprocess: %v", batch, err)
+				}
+			}
+
+			// Wait for the process to exit
+			if cmd != nil {
+				err := cmd.Wait()
+				if err != nil {
+					// Check if it was killed by signal (expected)
+					if exitErr, ok := err.(*exec.ExitError); ok {
+						if exitErr.String() == "signal: terminated" || exitErr.String() == "signal: killed" {
+							totalKilled++
+						} else {
+							totalErrors++
+						}
+					} else {
+						totalErrors++
+					}
+				} else {
+					// Clean exit (exit code 0)
+					totalCleanExits++
+				}
+			}
+
+			// Update index for logging
+			_ = i
+		}
+
+		batchDuration := time.Since(batchStartTime)
+		subprocessIdx += currentBatchSize
+
+		// Log progress every 10 batches
+		if (batch+1)%10 == 0 || batch == numBatches-1 {
+			log.Printf("  Completed batch %d/%d (duration: %v, total processed: %d/%d)",
+				batch+1, numBatches, batchDuration, subprocessIdx, iterations)
+		}
+
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			log.Println("Churn test interrupted by user")
+			return ctx.Err()
+		default:
+		}
+	}
+
+	totalDuration := time.Since(startTime)
+
+	// Print summary
+	fmt.Println("\n=== SUBPROCESS CHURN TEST SUMMARY ===")
+	fmt.Printf("Total subprocesses attempted:  %d\n", iterations)
+	fmt.Printf("Successfully started:          %d\n", totalStarted)
+	fmt.Printf("Clean exits:                   %d\n", totalCleanExits)
+	fmt.Printf("Killed by signal:              %d\n", totalKilled)
+	fmt.Printf("Errors:                        %d\n", totalErrors)
+	fmt.Println()
+	fmt.Printf("Total duration:                %v\n", totalDuration)
+	fmt.Printf("Average time per batch:        %v\n", totalDuration/time.Duration(numBatches))
+	fmt.Printf("Subprocesses per second:       %.2f\n", float64(totalStarted)/totalDuration.Seconds())
+
+	if totalErrors > 0 {
+		return fmt.Errorf("churn test completed with %d errors", totalErrors)
+	}
+
+	return nil
 }
 
 func runSingleConnection(ctx context.Context, serverIp netip.Addr, password string, wgClient *wgctrl.Client) error {
