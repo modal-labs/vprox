@@ -94,6 +94,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}
 	// Notify the server when we disconnect so it can reclaim resources immediately.
 	defer func() {
+		log.Println("About send /disconnect request to server.")
 		if err := client.Disconnect(); err != nil {
 			log.Printf("warning: failed to disconnect from server: %v", err)
 		}
