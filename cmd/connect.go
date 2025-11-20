@@ -76,6 +76,12 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		},
 	}
 
+	// Protect resource-cleanup work (executed in defer statements below) by
+	// registering a signal handler. We make sure that cleanup work is done when
+	// we receive a SIGINT/SIGKILL.
+	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer done()
+
 	err = client.CreateInterface()
 	if err != nil {
 		return err
@@ -93,9 +99,6 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer done()
-
 	log.Println("Connected...")
 	if !client.CheckConnection(healthCheckTimeout, ctx) {
 		return fmt.Errorf("connection failed initial healthcheck after %v", healthCheckTimeout)
@@ -105,6 +108,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		// currently in a healthy state
 		select {
 		case <-ctx.Done():
+			log.Println("Context is Done. Returning from runConnect.")
 			return nil
 		case <-time.After(healthCheckInterval):
 		}
@@ -124,6 +128,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 				select {
 				case <-ctx.Done():
+					log.Println("Context is Done; received SIGINT or SIGTERM. Breaking out of unhealthy_loop.")
 					break unhealthy_loop
 				case <-time.After(reconnectInterval):
 				}

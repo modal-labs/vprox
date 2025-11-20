@@ -227,7 +227,12 @@ func (c *Client) Disconnect() error {
 
 func (c *Client) DeleteInterface() {
 	// Delete the WireGuard interface.
-	netlink.LinkDel(c.link())
+	err := netlink.LinkDel(c.link())
+	if err != nil {
+		log.Printf("error deleting vprox interface %v: %v", c.Ifname, err)
+	} else {
+		log.Printf("successfully deleted vprox interface %v", c.Ifname)
+	}
 }
 
 func (c *Client) link() *linkWireguard {
