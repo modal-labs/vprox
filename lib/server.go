@@ -83,7 +83,7 @@ type Server struct {
 	ipAllocator *IpAllocator
 
 	mu       sync.Mutex // Protects the fields below.
-	newPeers map[wgtypes.Key]PeerInfo
+	allPeers map[wgtypes.Key]PeerInfo
 }
 
 // InitState initializes the private server state.
@@ -102,7 +102,7 @@ func (srv *Server) InitState() error {
 	if reservedIp != srv.WgCidr.Addr() {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
-	srv.newPeers = make(map[wgtypes.Key]PeerInfo)
+	srv.allPeers = make(map[wgtypes.Key]PeerInfo)
 	return nil
 }
 
@@ -155,7 +155,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	srv.mu.Lock()
-	peerInfo, exists := srv.newPeers[peerKey]
+	peerInfo, exists := srv.allPeers[peerKey]
 	srv.mu.Unlock()
 
 	// If the new connection already exists as a peer, just return that IP.
@@ -174,7 +174,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	srv.mu.Lock()
-	srv.newPeers[peerKey] = PeerInfo{
+	srv.allPeers[peerKey] = PeerInfo{
 		ConnectionTime: time.Now(),
 		PeerIp:         peerIp,
 	}
@@ -193,7 +193,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		srv.mu.Lock()
-		delete(srv.newPeers, peerKey)
+		delete(srv.allPeers, peerKey)
 		srv.mu.Unlock()
 
 		srv.ipAllocator.Free(peerIp)
@@ -422,21 +422,21 @@ func (srv *Server) removeIdlePeersLoop() {
 }
 
 // cleanupPeer removes a peer from the WireGuard interface, reclaims its subnet IP,
-// and removes it from the newPeers map. This function is idempotent and safe to call
-// even if the peer doesn't exist. It uses the newPeers map as the source of truth.
+// and removes it from the allPeers map. This function is idempotent and safe to call
+// even if the peer doesn't exist. It uses the allPeers map as the source of truth.
 func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
-	// Look up the peer in newPeers map to get its IP address.
+	// Look up the peer in allPeers map to get its IP address.
 	srv.mu.Lock()
-	peerInfo, exists := srv.newPeers[publicKey]
+	peerInfo, exists := srv.allPeers[publicKey]
 	if !exists {
-		// Peer not in newPeers - already cleaned up (idempotent).
+		// Peer not in allPeers - it likely already got cleaned up.
 		srv.mu.Unlock()
 		return nil
 	}
 
-	// Extract peer info and remove from newPeers.
+	// Extract peer info and remove from allPeers.
 	peerIp := peerInfo.PeerIp
-	delete(srv.newPeers, publicKey)
+	delete(srv.allPeers, publicKey)
 	srv.mu.Unlock()
 
 	// Remove the peer from WireGuard (no lock held during WireGuard operations).
@@ -467,24 +467,23 @@ func (srv *Server) removeIdlePeers() error {
 		return fmt.Errorf("failed to get WireGuard device: %v", err)
 	}
 
-	// Hold the lock for access to newPeers.
+	// Hold the lock for access to allPeers.
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-
-	// Clean up old entries from newPeers map, which should have connected by now.
-	for key, peerInfo := range srv.newPeers {
-		if time.Since(peerInfo.ConnectionTime) > PeerIdleTimeout {
-			delete(srv.newPeers, key)
-		}
-	}
 
 	var removePeers []wgtypes.PeerConfig
 	var removeIps []netip.Addr
 	for _, peer := range device.Peers {
 		var idle bool
 		if peer.LastHandshakeTime.IsZero() {
-			_, isNew := srv.newPeers[peer.PublicKey]
-			idle = !isNew
+			peerInfo, exists := srv.allPeers[peer.PublicKey]
+			if exists {
+				idle = time.Since(peerInfo.ConnectionTime) > PeerIdleTimeout
+			} else {
+				// If we somehow have a WireGuard interface for a peer but no allPeers entry,
+				// let's just assume it's idle and remove it.
+				idle = true
+			}
 		} else {
 			idle = time.Since(peer.LastHandshakeTime) > PeerIdleTimeout
 		}
@@ -502,6 +501,7 @@ func (srv *Server) removeIdlePeers() error {
 				PublicKey: peer.PublicKey,
 				Remove:    true,
 			})
+			delete(srv.allPeers, peer.PublicKey)
 		}
 	}
 
