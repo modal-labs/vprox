@@ -126,7 +126,10 @@ func runConnect(cmd *cobra.Command, args []string) error {
 					log.Println("Reconnected...")
 					break unhealthy_loop
 				}
-
+				if !lib.IsRecoverableError(err) {
+					return fmt.Errorf("unrecoverable connection error: %w", err)
+				}
+				log.Printf("Failed to reconnect: %v", err)
 				select {
 				case <-ctx.Done():
 					log.Println("Context is Done; received SIGINT or SIGTERM. Breaking out of unhealthy_loop.")
