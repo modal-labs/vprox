@@ -164,10 +164,10 @@ func (c *Client) sendConnectionRequest() (connectResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		recoverable := resp.StatusCode == http.StatusUnauthorized
+		unrecoverable := resp.StatusCode == http.StatusUnauthorized
 		return connectResponse{}, &ConnectionError{
 			Message:     fmt.Sprintf("server returned status %v", resp.Status),
-			Recoverable: recoverable,
+			Recoverable: !unrecoverable,
 		}
 	}
 

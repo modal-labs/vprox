@@ -121,24 +121,18 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		unhealthy_loop:
 			for {
 				// currently in an unhealthy state
-				connectResult := make(chan error, 1)
-				go func() { connectResult <- client.Connect() }()
-
-				select {
-				case err = <-connectResult:
-					if err == nil {
-						log.Println("Reconnected...")
-						break unhealthy_loop
-					}
+				err = client.Connect()
+				if err != nil {
 					if !lib.IsRecoverableError(err) {
 						return fmt.Errorf("unrecoverable connection error: %w", err)
 					}
 					log.Printf("Failed to reconnect: %v", err)
-				case <-time.After(reconnectInterval):
-					log.Println("Reconnect timed out. Retrying...")
+				}
+				select {
 				case <-ctx.Done():
 					log.Println("Context is Done; received SIGINT or SIGTERM. Breaking out of unhealthy_loop.")
 					break unhealthy_loop
+				case <-time.After(reconnectInterval):
 				}
 			}
 		}
