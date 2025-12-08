@@ -130,6 +130,9 @@ func runConnect(cmd *cobra.Command, args []string) error {
 						log.Println("Reconnected...")
 						break unhealthy_loop
 					}
+					if !lib.IsRecoverableError(err) {
+						return fmt.Errorf("unrecoverable connection error: %w", err)
+					}
 					log.Printf("Failed to reconnect: %v", err)
 				case <-time.After(reconnectInterval):
 					log.Println("Reconnect timed out. Retrying...")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,26 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
+
+// Used to determine if we can recover from an error during connection setup.
+type ConnectionError struct {
+	Message     string
+	Recoverable bool
+}
+
+func (e *ConnectionError) Error() string {
+	return e.Message
+}
+
+// IsRecoverableError returns false if the error is a ConnectionError that is not recoverable.
+func IsRecoverableError(err error) bool {
+	var connErr *ConnectionError
+	if errors.As(err, &connErr) {
+		return connErr.Recoverable
+	}
+	// By default assume recoverable.
+	return true
+}
 
 // Client manages a peering connection with with a local WireGuard interface.
 type Client struct {
@@ -143,7 +164,11 @@ func (c *Client) sendConnectionRequest() (connectResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return connectResponse{}, fmt.Errorf("server returned status %v", resp.Status)
+		recoverable := resp.StatusCode == http.StatusUnauthorized
+		return connectResponse{}, &ConnectionError{
+			Message:     fmt.Sprintf("server returned status %v", resp.Status),
+			Recoverable: recoverable,
+		}
 	}
 
 	buf, err = io.ReadAll(resp.Body)
