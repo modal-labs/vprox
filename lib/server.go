@@ -431,6 +431,7 @@ func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
 	if !exists {
 		// Peer not in allPeers - it likely already got cleaned up.
 		srv.mu.Unlock()
+		log.Printf("[%v] peer unexpectedly not found in allPeers - did /disconnect race with the periodic peer-GC loop?: %v", srv.BindAddr, publicKey)
 		return nil
 	}
 
