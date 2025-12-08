@@ -124,29 +124,16 @@ func runConnect(cmd *cobra.Command, args []string) error {
 				connectResult := make(chan error, 1)
 				go func() { connectResult <- client.Connect() }()
 
-				timer := time.NewTimer(reconnectInterval)
-
 				select {
 				case err = <-connectResult:
 					if err == nil {
-						timer.Stop()
 						log.Println("Reconnected...")
 						break unhealthy_loop
 					}
 					log.Printf("Failed to reconnect: %v", err)
-					// Wait for the remaining interval
-					select {
-					case <-timer.C:
-						continue unhealthy_loop
-					case <-ctx.Done():
-						log.Println("Context is Done; received SIGINT or SIGTERM. Breaking out of unhealthy_loop.")
-						break unhealthy_loop
-					}
-				case <-timer.C:
+				case <-time.After(reconnectInterval):
 					log.Println("Reconnect timed out. Retrying...")
-					continue unhealthy_loop
 				case <-ctx.Done():
-					timer.Stop()
 					log.Println("Context is Done; received SIGINT or SIGTERM. Breaking out of unhealthy_loop.")
 					break unhealthy_loop
 				}
