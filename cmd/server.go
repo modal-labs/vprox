@@ -28,6 +28,7 @@ var serverCmdArgs struct {
 	wgBlock      string
 	wgBlockPerIp string
 	cloud        string
+	takeover     bool
 }
 
 func init() {
@@ -39,6 +40,8 @@ func init() {
 		"", "WireGuard block size for each --ip flag, if multiple are provided")
 	ServerCmd.Flags().StringVar(&serverCmdArgs.cloud, "cloud",
 		"", "Cloud provider for IP metadata (watches for changes)")
+	ServerCmd.Flags().BoolVar(&serverCmdArgs.takeover, "takeover",
+		false, "Take over existing WireGuard state from a previous server instance (for non-disruptive upgrades)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
@@ -97,7 +100,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, password)
+	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, password, serverCmdArgs.takeover)
 	if err != nil {
 		done()
 		return err
