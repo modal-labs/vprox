@@ -3,8 +3,10 @@ package cmd
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
 	"os/signal"
@@ -23,6 +25,36 @@ const healthCheckInterval = 2 * time.Second
 
 const healthCheckTimeout = 5 * time.Second // how long do we wait before the health check times out?
 const reconnectInterval = 2 * time.Second  // when we're unhealthy, how frequently do we try reconnecting?
+const dialRetryTimeout = 10 * time.Second  // how long to retry on ECONNREFUSED
+
+// dialWithRetry retries TCP connections on ECONNREFUSED up to dialRetryTimeout.
+func dialWithRetry(ctx context.Context, network, addr string) (net.Conn, error) {
+	deadline := time.Now().Add(dialRetryTimeout)
+	dialer := &net.Dialer{}
+
+	for {
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err == nil {
+			return conn, nil
+		}
+
+		// Check if error is ECONNREFUSED
+		var syscallErr syscall.Errno
+		if errors.As(err, &syscallErr) && syscallErr == syscall.ECONNREFUSED {
+			// Retry if we still have time
+			if time.Now().Before(deadline) {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(100 * time.Millisecond):
+					continue
+				}
+			}
+		}
+
+		return nil, err
+	}
+}
 
 var ConnectCmd = &cobra.Command{
 	Use:        "connect [flags] <ip>",
@@ -72,6 +104,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			Timeout: 5 * time.Second,
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				DialContext:     dialWithRetry,
 			},
 		},
 	}
