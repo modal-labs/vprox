@@ -377,6 +377,39 @@ func (srv *Server) relinquishHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(respBuf)
 }
 
+type versionResponse struct {
+	GitCommit string `json:"git_commit"`
+	GitTag    string `json:"git_tag"`
+}
+
+// Handle a version request - returns the server version information.
+func (srv *Server) versionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	auth := r.Header.Get("Authorization")
+	if auth != "Bearer "+srv.Password {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	resp := &versionResponse{
+		GitCommit: GitCommit,
+		GitTag:    GitTag,
+	}
+
+	respBuf, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, "failed to serialize response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(respBuf)
+}
+
 func (srv *Server) Ifname() string {
 	return fmt.Sprintf("vprox%d", srv.Index)
 }
@@ -672,6 +705,7 @@ func (srv *Server) ListenForHttps() error {
 	mux.HandleFunc("/connect", srv.connectHandler)
 	mux.HandleFunc("/disconnect", srv.disconnectHandler)
 	mux.HandleFunc("/relinquish", srv.relinquishHandler)
+	mux.HandleFunc("/version", srv.versionHandler)
 
 	cert, err := loadServerTls()
 	if err != nil {
