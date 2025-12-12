@@ -117,7 +117,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		WgClient: sm.wgClient,
 		WgCidr:   wgCidr,
 		Ctx:      subctx,
-		Takeover: sm.takeover,
+		takeover: sm.takeover,
 	}
 	if err := srv.InitState(); err != nil {
 		_ = cancel // cancel should be discarded

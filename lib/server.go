@@ -89,9 +89,9 @@ type Server struct {
 	// Set via the /relinquish endpoint for non-disruptive upgrades.
 	relinquished bool
 
-	// Takeover indicates this server should take over existing WireGuard state
+	// takeover indicates this server should take over existing WireGuard state
 	// instead of creating a fresh interface. Used for non-disruptive upgrades.
-	Takeover bool
+	takeover bool
 }
 
 // InitState initializes the private server state.
@@ -113,7 +113,7 @@ func (srv *Server) InitState() error {
 	srv.allPeers = make(map[wgtypes.Key]PeerInfo)
 
 	// In takeover mode, initialize state from existing WireGuard peers
-	if srv.Takeover {
+	if srv.takeover {
 		if err := srv.initStateFromWireguard(); err != nil {
 			return fmt.Errorf("failed to initialize state from WireGuard: %v", err)
 		}
@@ -419,7 +419,7 @@ func (srv *Server) StartWireguard() error {
 	ifname := srv.Ifname()
 	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
 
-	if srv.Takeover {
+	if srv.takeover {
 		// In takeover mode, verify the interface exists and use it as-is
 		_, err := netlink.LinkByName(ifname)
 		if err != nil {
@@ -454,7 +454,7 @@ func (srv *Server) StartWireguard() error {
 		ListenPort: &listenPort,
 	})
 	if err != nil {
-		if !srv.Takeover {
+		if !srv.takeover {
 			netlink.LinkDel(link)
 		}
 		return err
