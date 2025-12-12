@@ -112,10 +112,15 @@ func (srv *Server) InitState() error {
 	}
 	srv.allPeers = make(map[wgtypes.Key]PeerInfo)
 
-	// In takeover mode, initialize state from existing WireGuard peers
+	// In takeover mode, initialize state from existing WireGuard peers if device exists
 	if srv.takeover {
-		if err := srv.initStateFromWireguard(); err != nil {
-			return fmt.Errorf("failed to initialize state from WireGuard: %v", err)
+		if _, err := srv.WgClient.Device(srv.Ifname()); err == nil {
+			log.Printf("[%v] takeover: inheriting state from existing WireGuard device", srv.BindAddr)
+			if err := srv.initStateFromWireguard(); err != nil {
+				return fmt.Errorf("failed to initialize state from WireGuard: %v", err)
+			}
+		} else {
+			log.Printf("[%v] takeover: WireGuard device not found, starting fresh", srv.BindAddr)
 		}
 	}
 
@@ -419,33 +424,29 @@ func (srv *Server) StartWireguard() error {
 	ifname := srv.Ifname()
 	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
 
+	// Track whether we created a fresh interface (for cleanup on error)
+	createdFreshInterface := false
+
 	if srv.takeover {
-		// In takeover mode, verify the interface exists and use it as-is
+		// In takeover mode, use existing interface if available, otherwise create fresh
 		_, err := netlink.LinkByName(ifname)
-		if err != nil {
-			return fmt.Errorf("takeover mode: WireGuard interface %s not found: %v", ifname, err)
+		if err == nil {
+			log.Printf("[%v] takeover mode: using existing WireGuard interface %s", srv.BindAddr, ifname)
+		} else {
+			// Interface doesn't exist, create fresh
+			log.Printf("[%v] takeover mode: interface %s not found, creating fresh", srv.BindAddr, ifname)
+			if err := srv.createFreshInterface(link); err != nil {
+				return err
+			}
+			createdFreshInterface = true
 		}
-		log.Printf("[%v] takeover mode: using existing WireGuard interface %s", srv.BindAddr, ifname)
 	} else {
 		// Normal mode: delete and recreate the interface
 		_ = netlink.LinkDel(link) // remove if it already exists
-		err := netlink.LinkAdd(link)
-		if err != nil {
-			return fmt.Errorf("failed to create WireGuard device: %v", err)
+		if err := srv.createFreshInterface(link); err != nil {
+			return err
 		}
-
-		ipnet := prefixToIPNet(srv.WgCidr)
-		err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipnet})
-		if err != nil {
-			netlink.LinkDel(link)
-			return fmt.Errorf("failed to add address to WireGuard device: %v", err)
-		}
-
-		err = netlink.LinkSetUp(link)
-		if err != nil {
-			netlink.LinkDel(link)
-			return fmt.Errorf("failed to bring up WireGuard device: %v", err)
-		}
+		createdFreshInterface = true
 	}
 
 	listenPort := WireguardListenPortBase + int(srv.Index)
@@ -454,10 +455,33 @@ func (srv *Server) StartWireguard() error {
 		ListenPort: &listenPort,
 	})
 	if err != nil {
-		if !srv.takeover {
+		if createdFreshInterface {
 			netlink.LinkDel(link)
 		}
 		return err
+	}
+
+	return nil
+}
+
+// createFreshInterface creates and configures a new WireGuard interface.
+func (srv *Server) createFreshInterface(link *linkWireguard) error {
+	err := netlink.LinkAdd(link)
+	if err != nil {
+		return fmt.Errorf("failed to create WireGuard device: %v", err)
+	}
+
+	ipnet := prefixToIPNet(srv.WgCidr)
+	err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipnet})
+	if err != nil {
+		netlink.LinkDel(link)
+		return fmt.Errorf("failed to add address to WireGuard device: %v", err)
+	}
+
+	err = netlink.LinkSetUp(link)
+	if err != nil {
+		netlink.LinkDel(link)
+		return fmt.Errorf("failed to bring up WireGuard device: %v", err)
 	}
 
 	return nil
