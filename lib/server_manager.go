@@ -34,10 +34,14 @@ type ServerManager struct {
 	// freeIndices and nextFreeIndex together track usage of the range 0..numWgBlocks
 	freeIndices   []uint16 // stack of indices that are free
 	nextFreeIndex uint16   // next free index not in the stack
+
+	// takeover indicates servers should take over existing WireGuard state
+	// instead of creating fresh interfaces. Used for non-disruptive upgrades.
+	takeover bool
 }
 
 // NewServerManager creates a new server manager
-func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Context, key wgtypes.Key, password string) (*ServerManager, error) {
+func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Context, key wgtypes.Key, password string, takeover bool) (*ServerManager, error) {
 	// Make a shared WireGuard client.
 	wgClient, err := wgctrl.New()
 	if err != nil {
@@ -64,6 +68,7 @@ func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Conte
 	sm.wgBlock = wgBlock.Masked()
 	sm.wgBlockPerIp = wgBlockPerIp
 	sm.activeServers = make(map[netip.Addr]ServerInfo)
+	sm.takeover = takeover
 	return sm, nil
 }
 
@@ -112,6 +117,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		WgClient: sm.wgClient,
 		WgCidr:   wgCidr,
 		Ctx:      subctx,
+		takeover: sm.takeover,
 	}
 	if err := srv.InitState(); err != nil {
 		_ = cancel // cancel should be discarded

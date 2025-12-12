@@ -84,6 +84,14 @@ type Server struct {
 
 	mu       sync.Mutex // Protects the fields below.
 	allPeers map[wgtypes.Key]PeerInfo
+
+	// relinquished indicates this server should not clean up WireGuard state on exit.
+	// Set via the /relinquish endpoint for non-disruptive upgrades.
+	relinquished bool
+
+	// takeover indicates this server should take over existing WireGuard state
+	// instead of creating a fresh interface. Used for non-disruptive upgrades.
+	takeover bool
 }
 
 // InitState initializes the private server state.
@@ -103,6 +111,58 @@ func (srv *Server) InitState() error {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
 	srv.allPeers = make(map[wgtypes.Key]PeerInfo)
+
+	// In takeover mode, initialize state from existing WireGuard peers if device exists
+	if srv.takeover {
+		if _, err := srv.WgClient.Device(srv.Ifname()); err == nil {
+			log.Printf("[%v] takeover: inheriting state from existing WireGuard device", srv.BindAddr)
+			if err := srv.initStateFromWireguard(); err != nil {
+				return fmt.Errorf("failed to initialize state from WireGuard: %v", err)
+			}
+		} else {
+			log.Printf("[%v] takeover: WireGuard device not found, starting fresh", srv.BindAddr)
+		}
+	}
+
+	return nil
+}
+
+// initStateFromWireguard populates allPeers and ipAllocator from existing WireGuard state.
+// Used in takeover mode to inherit state from a previous server instance.
+func (srv *Server) initStateFromWireguard() error {
+	device, err := srv.WgClient.Device(srv.Ifname())
+	if err != nil {
+		return fmt.Errorf("failed to get WireGuard device: %v", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	for _, peer := range device.Peers {
+		if len(peer.AllowedIPs) == 0 {
+			continue
+		}
+
+		// Extract the peer's IP from AllowedIPs
+		ipv4 := peer.AllowedIPs[0].IP.To4()
+		if ipv4 == nil {
+			continue
+		}
+		peerIp := netip.AddrFrom4([4]byte(ipv4))
+
+		// Mark the IP as allocated
+		srv.ipAllocator.MarkAllocated(peerIp)
+
+		// Add to allPeers with current time as connection time
+		srv.allPeers[peer.PublicKey] = PeerInfo{
+			ConnectionTime: time.Now(),
+			PeerIp:         peerIp,
+		}
+
+		log.Printf("[%v] takeover: inherited peer %v at %v", srv.BindAddr, peer.PublicKey, peerIp)
+	}
+
+	log.Printf("[%v] takeover: inherited %d peers from WireGuard state", srv.BindAddr, len(srv.allPeers))
 	return nil
 }
 
@@ -284,6 +344,78 @@ func (srv *Server) disconnectHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(respBuf)
 }
 
+type relinquishResponse struct {
+	Status string
+}
+
+// Handle a relinquish request - marks the server to preserve WireGuard state on exit.
+// Used for non-disruptive software upgrades. This is meant to be called by an "external"
+// software update process, not by the vprox client.
+func (srv *Server) relinquishHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	auth := r.Header.Get("Authorization")
+	if auth != "Bearer "+srv.Password {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	srv.mu.Lock()
+	srv.relinquished = true
+	srv.mu.Unlock()
+
+	log.Printf("[%v] server relinquished - WireGuard state will be preserved on exit", srv.BindAddr)
+
+	resp := &relinquishResponse{
+		Status: "relinquished",
+	}
+
+	respBuf, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, "failed to serialize response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(respBuf)
+}
+
+type versionResponse struct {
+	GitCommit string `json:"git_commit"`
+	GitTag    string `json:"git_tag"`
+}
+
+// Handle a version request - returns the server version information.
+func (srv *Server) versionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	auth := r.Header.Get("Authorization")
+	if auth != "Bearer "+srv.Password {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	resp := &versionResponse{
+		GitCommit: GitCommit,
+		GitTag:    GitTag,
+	}
+
+	respBuf, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, "failed to serialize response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(respBuf)
+}
+
 func (srv *Server) Ifname() string {
 	return fmt.Sprintf("vprox%d", srv.Index)
 }
@@ -291,7 +423,49 @@ func (srv *Server) Ifname() string {
 func (srv *Server) StartWireguard() error {
 	ifname := srv.Ifname()
 	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
-	_ = netlink.LinkDel(link) // remove if it already exists
+
+	// Track whether we created a fresh interface (for cleanup on error)
+	createdFreshInterface := false
+
+	if srv.takeover {
+		// In takeover mode, use existing interface if available, otherwise create fresh
+		_, err := netlink.LinkByName(ifname)
+		if err == nil {
+			log.Printf("[%v] takeover mode: using existing WireGuard interface %s", srv.BindAddr, ifname)
+		} else {
+			// Interface doesn't exist, create fresh
+			log.Printf("[%v] takeover mode: interface %s not found, creating fresh", srv.BindAddr, ifname)
+			if err := srv.createFreshInterface(link); err != nil {
+				return err
+			}
+			createdFreshInterface = true
+		}
+	} else {
+		// Normal mode: delete and recreate the interface
+		_ = netlink.LinkDel(link) // remove if it already exists
+		if err := srv.createFreshInterface(link); err != nil {
+			return err
+		}
+		createdFreshInterface = true
+	}
+
+	listenPort := WireguardListenPortBase + int(srv.Index)
+	err := srv.WgClient.ConfigureDevice(ifname, wgtypes.Config{
+		PrivateKey: &srv.Key,
+		ListenPort: &listenPort,
+	})
+	if err != nil {
+		if createdFreshInterface {
+			netlink.LinkDel(link)
+		}
+		return err
+	}
+
+	return nil
+}
+
+// createFreshInterface creates and configures a new WireGuard interface.
+func (srv *Server) createFreshInterface(link *linkWireguard) error {
 	err := netlink.LinkAdd(link)
 	if err != nil {
 		return fmt.Errorf("failed to create WireGuard device: %v", err)
@@ -310,22 +484,21 @@ func (srv *Server) StartWireguard() error {
 		return fmt.Errorf("failed to bring up WireGuard device: %v", err)
 	}
 
-	listenPort := WireguardListenPortBase + int(srv.Index)
-	err = srv.WgClient.ConfigureDevice(ifname, wgtypes.Config{
-		PrivateKey: &srv.Key,
-		ListenPort: &listenPort,
-	})
-	if err != nil {
-		netlink.LinkDel(link)
-		return err
-	}
-
 	return nil
 }
 
 func (srv *Server) CleanupWireguard() {
-	ifname := srv.Ifname()
-	_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
+	srv.mu.Lock()
+	relinquished := srv.relinquished
+	srv.mu.Unlock()
+
+	if relinquished {
+		log.Printf("[%v] skipping WireGuard cleanup (relinquished)", srv.BindAddr)
+	} else {
+		log.Printf("[%v] cleaning up WireGuard state", srv.BindAddr)
+		ifname := srv.Ifname()
+		_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
+	}
 }
 
 // iptablesInputFwmarkRule adds or removes the mangle PREROUTING rule for traffic from WireGuard.
@@ -556,6 +729,8 @@ func (srv *Server) ListenForHttps() error {
 	mux.HandleFunc("/", srv.indexHandler)
 	mux.HandleFunc("/connect", srv.connectHandler)
 	mux.HandleFunc("/disconnect", srv.disconnectHandler)
+	mux.HandleFunc("/relinquish", srv.relinquishHandler)
+	mux.HandleFunc("/version", srv.versionHandler)
 
 	cert, err := loadServerTls()
 	if err != nil {

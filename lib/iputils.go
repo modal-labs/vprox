@@ -103,6 +103,22 @@ func (ipa *IpAllocator) Free(addr netip.Addr) bool {
 	return false
 }
 
+// MarkAllocated marks the given IP as allocated without going through the normal
+// allocation sequence. Used for takeover mode to mark IPs that are already in use
+// by existing WireGuard peers.
+func (ipa *IpAllocator) MarkAllocated(addr netip.Addr) {
+	ipa.mu.Lock()
+	defer ipa.mu.Unlock()
+
+	if !ipa.prefix.Contains(addr) {
+		return // not in prefix
+	}
+	if _, ok := ipa.allocated[addr]; ok {
+		return // already allocated; do nothing
+	}
+	ipa.allocated[addr] = struct{}{}
+}
+
 // AfterCountIpBlock returns the result of incrementing an IP address by N CIDR
 // counts.
 func AfterCountIpBlock(ip netip.Addr, size uint, count uint) netip.Addr {
