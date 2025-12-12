@@ -34,6 +34,7 @@ func dialWithRetry(ctx context.Context, network, addr string) (net.Conn, error) 
 
 	for {
 		conn, err := dialer.DialContext(ctx, network, addr)
+
 		if err == nil {
 			return conn, nil
 		}
@@ -47,11 +48,13 @@ func dialWithRetry(ctx context.Context, network, addr string) (net.Conn, error) 
 				case <-ctx.Done():
 					return nil, ctx.Err()
 				case <-time.After(100 * time.Millisecond):
+					log.Printf("dialWithRetry retrying after ECONNREFUSED...")
 					continue
 				}
 			}
 		}
 
+		log.Printf("dialWithRetry failed even after %v of retrying. error: %v", dialRetryTimeout, err)
 		return nil, err
 	}
 }

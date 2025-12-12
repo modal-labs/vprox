@@ -344,7 +344,8 @@ type relinquishResponse struct {
 }
 
 // Handle a relinquish request - marks the server to preserve WireGuard state on exit.
-// Used for non-disruptive software upgrades.
+// Used for non-disruptive software upgrades. This is meant to be called by an "external"
+// software update process, not by the vprox client.
 func (srv *Server) relinquishHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
