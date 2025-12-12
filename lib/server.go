@@ -494,11 +494,11 @@ func (srv *Server) CleanupWireguard() {
 
 	if relinquished {
 		log.Printf("[%v] skipping WireGuard cleanup (relinquished)", srv.BindAddr)
-		return
+	} else {
+		log.Printf("[%v] cleaning up WireGuard state", srv.BindAddr)
+		ifname := srv.Ifname()
+		_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
 	}
-
-	ifname := srv.Ifname()
-	_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
 }
 
 // iptablesInputFwmarkRule adds or removes the mangle PREROUTING rule for traffic from WireGuard.
