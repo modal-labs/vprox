@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -500,7 +499,6 @@ func (srv *Server) CleanupWireguard() {
 		ifname := srv.Ifname()
 		_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
 	}
-	_ = os.Stderr.Sync()
 }
 
 // iptablesInputFwmarkRule adds or removes the mangle PREROUTING rule for traffic from WireGuard.
@@ -765,7 +763,6 @@ func (srv *Server) ListenForHttps() error {
 	select {
 	case <-srv.Ctx.Done():
 		log.Printf("server no longer listening on %v:443\n", srv.BindAddr)
-		_ = os.Stderr.Sync()
 		return httpServer.Shutdown(srv.Ctx)
 	case err = <-errCh:
 		return err
