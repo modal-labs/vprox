@@ -106,8 +106,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	defer sm.Wait()
 	defer done()
+	defer sm.Wait()
 
 	if cloud == "aws" {
 		initialIps, err := pollAws(lib.NewAwsMetadata(), make(ipSet), sm)
