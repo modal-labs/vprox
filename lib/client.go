@@ -74,6 +74,20 @@ func (c *Client) CreateInterface() error {
 		return fmt.Errorf("error creating vprox interface: %v", err)
 	}
 
+	// Set MTU explicitly for optimal throughput (matching server-side WireguardMTU)
+	err = netlink.LinkSetMTU(link, 1420)
+	if err != nil {
+		netlink.LinkDel(link)
+		return fmt.Errorf("error setting MTU on vprox interface: %v", err)
+	}
+
+	// Set TxQLen for improved burst handling (matching server-side WireguardTxQLen)
+	err = netlink.LinkSetTxQLen(link, 1000)
+	if err != nil {
+		// Non-fatal: log warning but continue
+		log.Printf("warning: failed to set TxQLen on vprox interface: %v", err)
+	}
+
 	return nil
 }
 
@@ -262,7 +276,15 @@ func (c *Client) DeleteInterface() {
 }
 
 func (c *Client) link() *linkWireguard {
-	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: c.Ifname}}
+	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{
+		Name:        c.Ifname,
+		MTU:         1420,  // WireguardMTU - must match server
+		TxQLen:      1000,  // WireguardTxQLen - for improved burst handling
+		NumTxQueues: 4,     // WireguardNumQueues - for parallel packet processing
+		NumRxQueues: 4,     // WireguardNumQueues - for parallel packet processing
+		GSOMaxSize:  65536, // WireguardGSOMaxSize - for GSO/GRO offload on Linux 5.19+
+		GROMaxSize:  65536,
+	}}
 }
 
 // CheckConnection checks the status of the connection with the wireguard peer,

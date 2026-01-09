@@ -28,6 +28,22 @@ const FwmarkBase = 0x54437D00
 // UDP listen port base value for WireGuard connections.
 const WireguardListenPortBase = 50227
 
+// WireGuard interface MTU. WireGuard adds ~60 bytes overhead (40 for IPv4/UDP + 16 for WG header + padding).
+// Setting MTU to 1420 prevents fragmentation on standard 1500 MTU networks.
+const WireguardMTU = 1420
+
+// WireGuard interface transmit queue length. Higher values reduce packet drops during traffic bursts.
+const WireguardTxQLen = 1000
+
+// GSO/GRO max size for improved throughput on Linux 5.19+. Allows batching packets before encryption.
+const WireguardGSOMaxSize = 65536
+
+// TCP MSS for WireGuard traffic. Calculated as MTU (1420) - TCP/IP headers (40) = 1380.
+const WireguardMSS = 1380
+
+// Number of TX/RX queues for parallel packet processing on multi-core systems.
+const WireguardNumQueues = 4
+
 // A new peer must connect with a handshake within this time.
 const FirstHandshakeTimeout = 10 * time.Second
 
@@ -422,7 +438,15 @@ func (srv *Server) Ifname() string {
 
 func (srv *Server) StartWireguard() error {
 	ifname := srv.Ifname()
-	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
+	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{
+		Name:        ifname,
+		MTU:         WireguardMTU,
+		TxQLen:      WireguardTxQLen,
+		NumTxQueues: WireguardNumQueues,
+		NumRxQueues: WireguardNumQueues,
+		GSOMaxSize:  WireguardGSOMaxSize,
+		GROMaxSize:  WireguardGSOMaxSize,
+	}}
 
 	// Track whether we created a fresh interface (for cleanup on error)
 	createdFreshInterface := false
@@ -450,9 +474,11 @@ func (srv *Server) StartWireguard() error {
 	}
 
 	listenPort := WireguardListenPortBase + int(srv.Index)
+	firewallMark := FwmarkBase + int(srv.Index)
 	err := srv.WgClient.ConfigureDevice(ifname, wgtypes.Config{
-		PrivateKey: &srv.Key,
-		ListenPort: &listenPort,
+		PrivateKey:   &srv.Key,
+		ListenPort:   &listenPort,
+		FirewallMark: &firewallMark,
 	})
 	if err != nil {
 		if createdFreshInterface {
@@ -476,6 +502,20 @@ func (srv *Server) createFreshInterface(link *linkWireguard) error {
 	if err != nil {
 		netlink.LinkDel(link)
 		return fmt.Errorf("failed to add address to WireGuard device: %v", err)
+	}
+
+	// Set MTU explicitly after link creation (some kernels ignore it in LinkAttrs)
+	err = netlink.LinkSetMTU(link, WireguardMTU)
+	if err != nil {
+		netlink.LinkDel(link)
+		return fmt.Errorf("failed to set MTU on WireGuard device: %v", err)
+	}
+
+	// Set TxQLen for improved burst handling
+	err = netlink.LinkSetTxQLen(link, WireguardTxQLen)
+	if err != nil {
+		// Non-fatal: log warning but continue
+		log.Printf("warning: failed to set TxQLen on WireGuard device: %v", err)
 	}
 
 	err = netlink.LinkSetUp(link)
@@ -531,20 +571,88 @@ func (srv *Server) iptablesSnatRule(enabled bool) error {
 	}
 }
 
-// iptablesMssRule adds or removes the FORWARD chain rule for TCP MSS adjustment
-func (srv *Server) iptablesMssRule(enabled bool) error {
-	rule := []string{
-		"-p", "tcp",
-		"--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS",
-		"--set-mss", "1160",
-		"-m", "comment", "--comment", fmt.Sprintf("vprox mss rule for %s", srv.Ifname()),
+// iptablesNotrackRule adds or removes NOTRACK rules in the raw table to bypass
+// connection tracking for established WireGuard UDP flows. This significantly
+// reduces CPU overhead for high-throughput scenarios.
+func (srv *Server) iptablesNotrackRule(enabled bool) error {
+	listenPort := WireguardListenPortBase + int(srv.Index)
+	ifname := srv.Ifname()
+
+	// NOTRACK for incoming WireGuard UDP packets (PREROUTING)
+	ruleIn := []string{
+		"-p", "udp",
+		"--dport", strconv.Itoa(listenPort),
+		"-j", "NOTRACK",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox notrack in for %s", ifname),
+	}
+	// NOTRACK for outgoing WireGuard UDP packets (OUTPUT)
+	ruleOut := []string{
+		"-p", "udp",
+		"--sport", strconv.Itoa(listenPort),
+		"-j", "NOTRACK",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox notrack out for %s", ifname),
 	}
 
 	if enabled {
-		return srv.Ipt.AppendUnique("filter", "FORWARD", rule...)
+		if err := srv.Ipt.AppendUnique("raw", "PREROUTING", ruleIn...); err != nil {
+			return err
+		}
+		if err := srv.Ipt.AppendUnique("raw", "OUTPUT", ruleOut...); err != nil {
+			srv.Ipt.Delete("raw", "PREROUTING", ruleIn...)
+			return err
+		}
+		return nil
 	} else {
-		return srv.Ipt.Delete("filter", "FORWARD", rule...)
+		errIn := srv.Ipt.Delete("raw", "PREROUTING", ruleIn...)
+		errOut := srv.Ipt.Delete("raw", "OUTPUT", ruleOut...)
+		if errIn != nil {
+			return errIn
+		}
+		return errOut
+	}
+}
+
+// iptablesMssRule adds or removes the FORWARD chain rule for TCP MSS adjustment.
+// The rule is scoped to traffic from/to the WireGuard interface for this server.
+func (srv *Server) iptablesMssRule(enabled bool) error {
+	ifname := srv.Ifname()
+	// Rule for traffic coming from the WireGuard interface
+	ruleIn := []string{
+		"-i", ifname,
+		"-p", "tcp",
+		"--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS",
+		"--set-mss", strconv.Itoa(WireguardMSS),
+		"-m", "comment", "--comment", fmt.Sprintf("vprox mss rule in for %s", ifname),
+	}
+	// Rule for traffic going to the WireGuard interface
+	ruleOut := []string{
+		"-o", ifname,
+		"-p", "tcp",
+		"--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS",
+		"--set-mss", strconv.Itoa(WireguardMSS),
+		"-m", "comment", "--comment", fmt.Sprintf("vprox mss rule out for %s", ifname),
+	}
+
+	if enabled {
+		if err := srv.Ipt.AppendUnique("filter", "FORWARD", ruleIn...); err != nil {
+			return err
+		}
+		if err := srv.Ipt.AppendUnique("filter", "FORWARD", ruleOut...); err != nil {
+			// Try to clean up the first rule if the second fails
+			srv.Ipt.Delete("filter", "FORWARD", ruleIn...)
+			return err
+		}
+		return nil
+	} else {
+		// Delete both rules, ignoring errors (rules may not exist)
+		errIn := srv.Ipt.Delete("filter", "FORWARD", ruleIn...)
+		errOut := srv.Ipt.Delete("filter", "FORWARD", ruleOut...)
+		if errIn != nil {
+			return errIn
+		}
+		return errOut
 	}
 }
 
@@ -567,15 +675,29 @@ func (srv *Server) StartIptables() error {
 		return fmt.Errorf("failed to add MSS rule: %v", err)
 	}
 
+	err = srv.iptablesNotrackRule(true)
+	if err != nil {
+		srv.iptablesMssRule(false)
+		srv.iptablesSnatRule(false)
+		srv.iptablesInputFwmarkRule(false)
+		return fmt.Errorf("failed to add NOTRACK rule: %v", err)
+	}
+
 	return nil
 }
 
 func (srv *Server) CleanupIptables() {
 	if err := srv.iptablesInputFwmarkRule(false); err != nil {
-		log.Printf("warning: error cleaning up IP tables: failed to add fwmark rule: %v\n", err)
+		log.Printf("warning: error cleaning up IP tables: failed to remove fwmark rule: %v\n", err)
 	}
 	if err := srv.iptablesSnatRule(false); err != nil {
-		log.Printf("warning: error cleaning up IP tables: failed to add SNAT rule: %v\n", err)
+		log.Printf("warning: error cleaning up IP tables: failed to remove SNAT rule: %v\n", err)
+	}
+	if err := srv.iptablesMssRule(false); err != nil {
+		log.Printf("warning: error cleaning up IP tables: failed to remove MSS rule: %v\n", err)
+	}
+	if err := srv.iptablesNotrackRule(false); err != nil {
+		log.Printf("warning: error cleaning up IP tables: failed to remove NOTRACK rule: %v\n", err)
 	}
 }
 
