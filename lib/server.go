@@ -62,8 +62,8 @@ type Server struct {
 	// Currently only setting this to the default interface is supported.
 	BindIface netlink.Link
 
-	// Password is needed to authenticate connection requests.
-	Password string
+	// Auth is the authenticator used to verify incoming requests.
+	Auth *Authenticator
 
 	// Index is a unique server index for firewall marks and other uses. It starts at 0.
 	Index uint16
@@ -190,8 +190,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := r.Header.Get("Authorization")
-	if auth != "Bearer "+srv.Password {
+	if err := srv.Auth.Authenticate(r); err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -294,8 +293,7 @@ func (srv *Server) disconnectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := r.Header.Get("Authorization")
-	if auth != "Bearer "+srv.Password {
+	if err := srv.Auth.Authenticate(r); err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -357,8 +355,7 @@ func (srv *Server) relinquishHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := r.Header.Get("Authorization")
-	if auth != "Bearer "+srv.Password {
+	if err := srv.Auth.Authenticate(r); err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -395,8 +392,7 @@ func (srv *Server) versionHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := r.Header.Get("Authorization")
-	if auth != "Bearer "+srv.Password {
+	if err := srv.Auth.Authenticate(r); err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

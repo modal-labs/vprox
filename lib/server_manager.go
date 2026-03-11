@@ -24,7 +24,7 @@ type ServerManager struct {
 	wgClient      *wgctrl.Client
 	ipt           *iptables.IPTables
 	key           wgtypes.Key
-	password      string
+	auth          *Authenticator
 	ctx           context.Context
 	waitGroup     *sync.WaitGroup
 	wgBlock       netip.Prefix
@@ -41,7 +41,7 @@ type ServerManager struct {
 }
 
 // NewServerManager creates a new server manager
-func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Context, key wgtypes.Key, password string, takeover bool) (*ServerManager, error) {
+func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Context, key wgtypes.Key, auth *Authenticator, takeover bool) (*ServerManager, error) {
 	// Make a shared WireGuard client.
 	wgClient, err := wgctrl.New()
 	if err != nil {
@@ -62,7 +62,7 @@ func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Conte
 	sm.wgClient = wgClient
 	sm.ipt = ipt
 	sm.key = key
-	sm.password = password
+	sm.auth = auth
 	sm.ctx = ctx
 	sm.waitGroup = new(sync.WaitGroup)
 	sm.wgBlock = wgBlock.Masked()
@@ -111,7 +111,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 	srv := &Server{
 		Key:      sm.key,
 		BindAddr: ip,
-		Password: sm.password,
+		Auth:     sm.auth,
 		Index:    i,
 		Ipt:      sm.ipt,
 		WgClient: sm.wgClient,

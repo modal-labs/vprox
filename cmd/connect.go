@@ -87,7 +87,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load server key: %v", err)
 	}
 
-	password, err := lib.GetVproxPassword()
+	token, err := lib.GetClientToken()
 	if err != nil {
 		return err
 	}
@@ -101,7 +101,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		Key:      key,
 		Ifname:   connectCmdArgs.ifname,
 		ServerIp: serverIp,
-		Password: password,
+		Token:    token,
 		WgClient: wgClient,
 		Http: &http.Client{
 			Timeout: 5 * time.Second,

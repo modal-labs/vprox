@@ -51,8 +51,10 @@ type Client struct {
 	// ServerIp is the public IPv4 address of the server.
 	ServerIp netip.Addr
 
-	// Password authenticates the client connection.
-	Password string
+	// Token is the bearer token used to authenticate with the server.
+	// In password mode, this is the VPROX_PASSWORD value.
+	// In OIDC mode, this is the MODAL_IDENTITY_TOKEN value.
+	Token string
 
 	// WgClient is a shared client for interacting with the WireGuard kernel module.
 	WgClient *wgctrl.Client
@@ -152,7 +154,7 @@ func (c *Client) sendConnectionRequest() (connectResponse, error) {
 		Method: http.MethodPost,
 		URL:    connectUrl,
 		Header: http.Header{
-			"Authorization": []string{"Bearer " + c.Password},
+			"Authorization": []string{"Bearer " + c.Token},
 		},
 		Body: io.NopCloser(bytes.NewBuffer(buf)),
 	}
@@ -231,7 +233,7 @@ func (c *Client) Disconnect() error {
 		Method: http.MethodPost,
 		URL:    disconnectUrl,
 		Header: http.Header{
-			"Authorization": []string{"Bearer " + c.Password},
+			"Authorization": []string{"Bearer " + c.Token},
 		},
 		Body: io.NopCloser(bytes.NewBuffer(buf)),
 	}
