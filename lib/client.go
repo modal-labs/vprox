@@ -556,8 +556,8 @@ func (c *Client) Disconnect() error {
 // CheckConnection checks the status of the connection with the wireguard peer,
 // and returns true if it is healthy. This sends 3 pings in succession, and blocks
 // until they receive a response or the timeout passes.
-// Pings are sent through the user-facing interface (Ifname — either the plain
-// WireGuard device in single-tunnel mode, or the bond in multi-tunnel mode).
+// In multi-tunnel mode, pings are sent through the first WireGuard tunnel
+// interface (not the dummy device) so replies are received on the same interface.
 func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Context) bool {
 	pinger, err := probing.NewPinger(c.wgCidr.Masked().Addr().Next().String())
 	if err != nil {
@@ -565,7 +565,10 @@ func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Contex
 		return false
 	}
 
-	pinger.InterfaceName = c.Ifname
+	// Use the first WireGuard tunnel for health checks. In single-tunnel mode
+	// tunnelIfname(0) == Ifname; in multi-tunnel mode it's the actual WireGuard
+	// device (e.g. "vprox0t0") rather than the dummy ("vprox0").
+	pinger.InterfaceName = c.tunnelIfname(0)
 	pinger.Timeout = timeout
 	pinger.Count = 3
 	pinger.Interval = 10 * time.Millisecond // Send approximately all at once
