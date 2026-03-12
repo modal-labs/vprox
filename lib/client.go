@@ -288,7 +288,7 @@ func (c *Client) setupMultipathRouting(nt int) error {
 			Dst:       &subnetIPNet,
 			Scope:     netlink.SCOPE_LINK,
 		}
-		if err := netlink.RouteAdd(route); err != nil {
+		if err := netlink.RouteAppend(route); err != nil {
 			return fmt.Errorf("failed to add route on %s: %v", ifname, err)
 		}
 	}
