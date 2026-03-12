@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"os"
 	"time"
 
 	probing "github.com/prometheus-community/pro-bing"
@@ -20,6 +19,14 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
+
+// PolicyRoutingTable is the custom routing table number used for multi-tunnel
+// multipath routing. Traffic from the vprox IP is redirected here via an
+// ip rule, and this table contains equal-cost routes across all tunnels.
+const PolicyRoutingTable = 51820
+
+// PolicyRoutingPriority is the ip rule priority for the vprox policy route.
+const PolicyRoutingPriority = 100
 
 // Used to determine if we can recover from an error during connection setup.
 type ConnectionError struct {
@@ -42,8 +49,7 @@ func IsRecoverableError(err error) bool {
 }
 
 // Client manages a peering connection with a local WireGuard interface, or a
-// set of parallel WireGuard interfaces bonded together when multi-tunnel is
-// enabled.
+// set of parallel WireGuard interfaces when multi-tunnel is enabled.
 //
 // Single-tunnel (NumTunnels <= 1):
 //
@@ -51,18 +57,20 @@ func IsRecoverableError(err error) bool {
 //
 // Multi-tunnel (NumTunnels > 1):
 //
-//	WireGuard slaves: vprox0t0, vprox0t1, vprox0t2, ...
-//	Bond master:      vprox0  (balance-rr, presents a single interface)
+//	WireGuard tunnels: vprox0t0, vprox0t1, vprox0t2, ...
+//	Dummy device:      vprox0  (holds the IP address, user-facing)
 //
-//	Applications bind to "vprox0" and the bonding driver distributes packets
-//	round-robin across the WireGuard slaves. Each slave uses a different UDP
-//	port to the server, so the NIC hashes them to different hardware RX queues.
+//	Applications bind to "vprox0" (the dummy interface). An ip rule redirects
+//	traffic sourced from the vprox IP into a custom routing table that has
+//	equal-cost multipath routes across the WireGuard tunnels. The kernel
+//	distributes flows across them via L4 hashing. Each tunnel uses a different
+//	UDP port so the NIC hashes the outer packets to different hardware RX queues.
 type Client struct {
 	// Key is the private key of the client.
 	Key wgtypes.Key
 
 	// Ifname is the name of the interface exposed to applications (e.g. "vprox0").
-	// In multi-tunnel mode this is the bond device; individual WireGuard tunnels
+	// In multi-tunnel mode this is a dummy device; individual WireGuard tunnels
 	// are named <Ifname>t0, <Ifname>t1, etc.
 	Ifname string
 
@@ -74,7 +82,7 @@ type Client struct {
 
 	// NumTunnels is the number of parallel WireGuard tunnels to create.
 	// When <= 1, the client creates a single plain WireGuard interface.
-	// When > 1, a bonding device is created over N WireGuard slaves.
+	// When > 1, a dummy device + policy routing is created over N WireGuard tunnels.
 	NumTunnels int
 
 	// WgClient is a shared client for interacting with the WireGuard kernel module.
@@ -137,7 +145,8 @@ func (c *Client) tunnelLink(t int) *linkWireguard {
 
 // CreateInterface creates the network interface(s) that applications will use.
 //   - Single-tunnel: one plain WireGuard interface named Ifname.
-//   - Multi-tunnel:  N WireGuard interfaces + a bond master named Ifname.
+//   - Multi-tunnel:  N WireGuard interfaces + a dummy device named Ifname
+//     with policy routing to distribute traffic across the tunnels.
 //
 // DeleteInterface() must be called to clean up.
 func (c *Client) CreateInterface() error {
@@ -153,15 +162,15 @@ func (c *Client) CreateInterface() error {
 		}
 	}
 
-	// In multi-tunnel mode, create a bond over the WireGuard slaves.
+	// In multi-tunnel mode, create a dummy device for the user-facing interface.
 	if c.isMultiTunnel() {
-		if err := c.createBond(nt); err != nil {
+		if err := c.createDummyInterface(); err != nil {
 			for t := 0; t < nt; t++ {
 				c.deleteTunnelInterface(t)
 			}
 			return err
 		}
-		log.Printf("created bond %s over %d tunnel slaves (%s .. %s)",
+		log.Printf("created dummy %s with %d WireGuard tunnels (%s .. %s)",
 			c.Ifname, nt, c.tunnelIfname(0), c.tunnelIfname(nt-1))
 	}
 
@@ -188,72 +197,47 @@ func (c *Client) createTunnelInterface(t int) error {
 		log.Printf("warning: failed to set TxQLen on %s: %v", link.Name, err)
 	}
 
-	// In multi-tunnel mode the slaves are brought up later when enslaved
-	// to the bond. In single-tunnel mode we don't bring it up yet either
-	// — Connect() will do it.
-
 	return nil
 }
 
-// createBond creates a balance-rr bond device named Ifname and enslaves all
-// WireGuard tunnel interfaces to it.
-func (c *Client) createBond(nt int) error {
-	// Ensure the bonding kernel module is loaded.
-	_ = writeSysFile("/sys/module/bonding/initstate", "")
-
-	bond := netlink.NewLinkBond(netlink.LinkAttrs{
-		Name:   c.Ifname,
-		MTU:    WireguardMTU,
-		TxQLen: WireguardTxQLen,
-	})
-	bond.Mode = netlink.BOND_MODE_BALANCE_RR
-	// MIIMon: link monitoring interval in ms. We set a low value so that if
-	// a slave goes down, the bond reacts quickly.
-	bond.Miimon = 100
-
-	// Remove any stale bond with this name.
+// createDummyInterface creates a dummy network interface named Ifname. This is
+// the user-facing device that applications bind to. A policy routing rule will
+// redirect its traffic into a custom table with multipath routes across the
+// WireGuard tunnels.
+func (c *Client) createDummyInterface() error {
+	// Remove any stale interface with this name.
 	if existing, _ := netlink.LinkByName(c.Ifname); existing != nil {
 		_ = netlink.LinkDel(existing)
 	}
 
-	if err := netlink.LinkAdd(bond); err != nil {
-		return fmt.Errorf("failed to create bond %s: %v", c.Ifname, err)
+	dummy := &netlink.Dummy{
+		LinkAttrs: netlink.LinkAttrs{
+			Name:   c.Ifname,
+			MTU:    WireguardMTU,
+			TxQLen: WireguardTxQLen,
+		},
 	}
 
-	// Enslave each WireGuard tunnel interface to the bond.
-	bondLink, err := netlink.LinkByName(c.Ifname)
-	if err != nil {
-		netlink.LinkDel(bond)
-		return fmt.Errorf("failed to find bond %s after creation: %v", c.Ifname, err)
-	}
-
-	for t := 0; t < nt; t++ {
-		slave, err := netlink.LinkByName(c.tunnelIfname(t))
-		if err != nil {
-			netlink.LinkDel(bond)
-			return fmt.Errorf("failed to find slave %s: %v", c.tunnelIfname(t), err)
-		}
-		// The slave must be down before enslaving.
-		_ = netlink.LinkSetDown(slave)
-		if err := netlink.LinkSetMaster(slave, bondLink); err != nil {
-			netlink.LinkDel(bond)
-			return fmt.Errorf("failed to enslave %s to %s: %v", c.tunnelIfname(t), c.Ifname, err)
-		}
+	if err := netlink.LinkAdd(dummy); err != nil {
+		return fmt.Errorf("failed to create dummy interface %s: %v", c.Ifname, err)
 	}
 
 	return nil
 }
 
-// DeleteInterface removes all interfaces (bond + WireGuard tunnels).
+// DeleteInterface removes all interfaces and policy routing rules.
 func (c *Client) DeleteInterface() {
 	if c.isMultiTunnel() {
-		// Deleting the bond master also releases the slaves.
-		log.Printf("About to delete bond interface %v", c.Ifname)
-		if bond, err := netlink.LinkByName(c.Ifname); err == nil {
-			if err := netlink.LinkDel(bond); err != nil {
-				log.Printf("error deleting bond %v: %v", c.Ifname, err)
+		// Clean up policy routing.
+		c.cleanupPolicyRouting()
+
+		// Delete the dummy interface.
+		log.Printf("About to delete dummy interface %v", c.Ifname)
+		if dummy, err := netlink.LinkByName(c.Ifname); err == nil {
+			if err := netlink.LinkDel(dummy); err != nil {
+				log.Printf("error deleting dummy %v: %v", c.Ifname, err)
 			} else {
-				log.Printf("successfully deleted bond %v", c.Ifname)
+				log.Printf("successfully deleted dummy %v", c.Ifname)
 			}
 		}
 	}
@@ -304,9 +288,8 @@ func (c *Client) Connect() error {
 	for t := 0; t < nt; t++ {
 		ifname := c.tunnelIfname(t)
 
-		// Bring the slave up (bond requires slaves to be up for traffic).
-		slave := c.tunnelLink(t)
-		if err := netlink.LinkSetUp(slave); err != nil {
+		link := c.tunnelLink(t)
+		if err := netlink.LinkSetUp(link); err != nil {
 			return fmt.Errorf("error setting up %s: %v", ifname, err)
 		}
 
@@ -329,6 +312,15 @@ func (c *Client) Connect() error {
 
 	if err := c.updateAddress(resp); err != nil {
 		return err
+	}
+
+	// In multi-tunnel mode, assign addresses to each tunnel and set up
+	// policy routing to distribute traffic across them.
+	if c.isMultiTunnel() && nt > 1 {
+		if err := c.setupPolicyRouting(nt); err != nil {
+			return fmt.Errorf("error setting up policy routing: %v", err)
+		}
+		log.Printf("policy routing configured across %d tunnels", nt)
 	}
 
 	return nil
@@ -375,6 +367,115 @@ func (c *Client) updateAddress(resp connectResponse) error {
 		c.wgCidr = cidr
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Policy routing (multi-tunnel)
+// ---------------------------------------------------------------------------
+
+// setupPolicyRouting creates:
+//  1. An ip rule that matches traffic from the vprox source IP and directs it
+//     to a custom routing table.
+//  2. Equal-cost multipath routes in that table across all WireGuard tunnels.
+//
+// This allows applications binding to the dummy vprox0 interface (or using the
+// vprox IP as source) to have their traffic distributed across tunnels by the
+// kernel's L4 flow hash.
+func (c *Client) setupPolicyRouting(nt int) error {
+	if !c.wgCidr.IsValid() {
+		return fmt.Errorf("no valid CIDR assigned yet")
+	}
+
+	// Assign the same IP address to each WireGuard tunnel interface so that
+	// the kernel can use any of them to reach the server WireGuard IP.
+	for t := 0; t < nt; t++ {
+		ifname := c.tunnelIfname(t)
+		tunnelLink, err := netlink.LinkByName(ifname)
+		if err != nil {
+			return fmt.Errorf("failed to find tunnel %s: %v", ifname, err)
+		}
+		ipnet := prefixToIPNet(c.wgCidr)
+		if err := netlink.AddrReplace(tunnelLink, &netlink.Addr{IPNet: &ipnet}); err != nil {
+			return fmt.Errorf("failed to assign address to %s: %v", ifname, err)
+		}
+	}
+
+	// Build multipath nexthops — one per tunnel interface.
+	gwAddr := c.wgCidr.Masked().Addr().Next()
+	gwIP := addrToIp(gwAddr)
+
+	var nexthops []*netlink.NexthopInfo
+	for t := 0; t < nt; t++ {
+		ifname := c.tunnelIfname(t)
+		tunnelLink, err := netlink.LinkByName(ifname)
+		if err != nil {
+			return fmt.Errorf("failed to find tunnel %s: %v", ifname, err)
+		}
+		nexthops = append(nexthops, &netlink.NexthopInfo{
+			LinkIndex: tunnelLink.Attrs().Index,
+			Gw:        gwIP,
+			Hops:      0,
+		})
+	}
+
+	// Add default multipath route in the custom table.
+	_, defaultDst, _ := net.ParseCIDR("0.0.0.0/0")
+	mpRoute := &netlink.Route{
+		Table:     PolicyRoutingTable,
+		Dst:       defaultDst,
+		MultiPath: nexthops,
+	}
+	if err := netlink.RouteReplace(mpRoute); err != nil {
+		return fmt.Errorf("failed to add multipath route to table %d: %v", PolicyRoutingTable, err)
+	}
+
+	// Add an ip rule: from <vprox-ip> lookup table PolicyRoutingTable.
+	srcIP := c.wgCidr.Addr()
+	srcNet := &net.IPNet{
+		IP:   addrToIp(srcIP),
+		Mask: net.CIDRMask(32, 32),
+	}
+	rule := netlink.NewRule()
+	rule.Src = srcNet
+	rule.Table = PolicyRoutingTable
+	rule.Priority = PolicyRoutingPriority
+
+	// Remove any stale rule first (idempotent).
+	_ = netlink.RuleDel(rule)
+
+	if err := netlink.RuleAdd(rule); err != nil {
+		return fmt.Errorf("failed to add ip rule for %v: %v", srcIP, err)
+	}
+
+	return nil
+}
+
+// cleanupPolicyRouting removes the ip rule and flushes the custom routing table.
+func (c *Client) cleanupPolicyRouting() {
+	if c.wgCidr.IsValid() {
+		srcIP := c.wgCidr.Addr()
+		srcNet := &net.IPNet{
+			IP:   addrToIp(srcIP),
+			Mask: net.CIDRMask(32, 32),
+		}
+		rule := netlink.NewRule()
+		rule.Src = srcNet
+		rule.Table = PolicyRoutingTable
+		rule.Priority = PolicyRoutingPriority
+		if err := netlink.RuleDel(rule); err != nil {
+			log.Printf("warning: failed to delete ip rule: %v", err)
+		}
+	}
+
+	// Flush routes in our custom table.
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{
+		Table: PolicyRoutingTable,
+	}, netlink.RT_FILTER_TABLE)
+	if err == nil {
+		for i := range routes {
+			_ = netlink.RouteDel(&routes[i])
+		}
+	}
 }
 
 // configureWireguardTunnel configures a single WireGuard tunnel interface with
@@ -530,14 +631,4 @@ func (c *Client) sendConnectionRequest() (connectResponse, error) {
 	var respJson connectResponse
 	json.Unmarshal(buf, &respJson)
 	return respJson, nil
-}
-
-// ---------------------------------------------------------------------------
-// Sysfs helper
-// ---------------------------------------------------------------------------
-
-// writeSysFile is a best-effort helper to write a value to a sysfs file.
-// Used to poke kernel module parameters. Errors are silently ignored.
-func writeSysFile(path, value string) error {
-	return os.WriteFile(path, []byte(value), 0644)
 }
