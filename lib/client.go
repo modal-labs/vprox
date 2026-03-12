@@ -278,11 +278,11 @@ func (c *Client) DeleteInterface() {
 func (c *Client) link() *linkWireguard {
 	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{
 		Name:        c.Ifname,
-		MTU:         1420,  // WireguardMTU - must match server
-		TxQLen:      1000,  // WireguardTxQLen - for improved burst handling
-		NumTxQueues: 4,     // WireguardNumQueues - for parallel packet processing
-		NumRxQueues: 4,     // WireguardNumQueues - for parallel packet processing
-		GSOMaxSize:  65536, // WireguardGSOMaxSize - for GSO/GRO offload on Linux 5.19+
+		MTU:         1420,
+		TxQLen:      1000,
+		NumTxQueues: 4,
+		NumRxQueues: 4,
+		GSOMaxSize:  65536,
 		GROMaxSize:  65536,
 	}}
 }
