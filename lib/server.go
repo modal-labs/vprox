@@ -648,11 +648,12 @@ func (srv *Server) createFreshInterface(link *linkWireguard, tunnelIndex int) er
 
 // setupPolicyRouting creates:
 //  1. Multipath routes in a custom routing table across all WireGuard tunnels.
-//  2. An ip rule that matches traffic from the server's WireGuard IP and directs
-//     it to that custom table.
+//  2. An ip rule that matches traffic destined for the WireGuard subnet and
+//     directs it to that custom table.
 //
-// This ensures reply traffic from the server is distributed across all tunnels
-// by the kernel's L4 flow hash, not just sent through tunnel 0.
+// The rule matches on destination (not source) because the server forwards
+// traffic from the internet to clients — the source IP of forwarded packets is
+// the remote host, not the server's WireGuard IP.
 func (srv *Server) setupPolicyRouting(nt int) error {
 	// Build multipath nexthops — one per tunnel interface. We use the subnet
 	// as the destination (not default) since the server only needs to reach
@@ -683,14 +684,15 @@ func (srv *Server) setupPolicyRouting(nt int) error {
 		return fmt.Errorf("failed to add multipath route to table %d: %v", PolicyRoutingTable, err)
 	}
 
-	// Add an ip rule: from <server wg ip> lookup custom table.
-	srcIP := srv.WgCidr.Addr()
-	srcNet := &net.IPNet{
-		IP:   addrToIp(srcIP),
-		Mask: net.CIDRMask(32, 32),
+	// Add an ip rule: to <wg subnet> lookup custom table.
+	// This catches both locally-originated replies and forwarded (NAT'd) traffic
+	// destined for any client in the WireGuard subnet.
+	dstNet := &net.IPNet{
+		IP:   addrToIp(srv.WgCidr.Masked().Addr()),
+		Mask: net.CIDRMask(srv.WgCidr.Bits(), 32),
 	}
 	rule := netlink.NewRule()
-	rule.Src = srcNet
+	rule.Dst = dstNet
 	rule.Table = PolicyRoutingTable
 	rule.Priority = PolicyRoutingPriority
 
@@ -698,7 +700,7 @@ func (srv *Server) setupPolicyRouting(nt int) error {
 	_ = netlink.RuleDel(rule)
 
 	if err := netlink.RuleAdd(rule); err != nil {
-		return fmt.Errorf("failed to add ip rule for %v: %v", srcIP, err)
+		return fmt.Errorf("failed to add ip rule for dst %v: %v", dstNet, err)
 	}
 
 	return nil
@@ -706,13 +708,12 @@ func (srv *Server) setupPolicyRouting(nt int) error {
 
 // cleanupPolicyRouting removes the ip rule and flushes the custom routing table.
 func (srv *Server) cleanupPolicyRouting() {
-	srcIP := srv.WgCidr.Addr()
-	srcNet := &net.IPNet{
-		IP:   addrToIp(srcIP),
-		Mask: net.CIDRMask(32, 32),
+	dstNet := &net.IPNet{
+		IP:   addrToIp(srv.WgCidr.Masked().Addr()),
+		Mask: net.CIDRMask(srv.WgCidr.Bits(), 32),
 	}
 	rule := netlink.NewRule()
-	rule.Src = srcNet
+	rule.Dst = dstNet
 	rule.Table = PolicyRoutingTable
 	rule.Priority = PolicyRoutingPriority
 	if err := netlink.RuleDel(rule); err != nil {
