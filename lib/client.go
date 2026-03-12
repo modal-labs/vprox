@@ -179,35 +179,31 @@ func (c *Client) Connect() error {
 	}
 	c.activeTunnels = nt
 
-	// Bring up and configure the primary interface (tunnel 0) — this is the
-	// one that gets the IP address and subnet route.
-	primaryLink := c.tunnelLink(0)
-	err = netlink.LinkSetUp(primaryLink)
-	if err != nil {
-		return fmt.Errorf("error setting up vprox interface: %v", err)
-	}
-
-	err = c.updateInterface(resp)
-	if err != nil {
-		return err
-	}
-
-	// Configure WireGuard on tunnel 0 using the primary ServerListenPort
-	// (works for both old and new servers).
-	err = c.configureWireguardTunnel(0, resp, resp.ServerListenPort)
-	if err != nil {
-		return fmt.Errorf("error configuring wireguard on %s: %v", c.tunnelIfname(0), err)
-	}
-
-	// Configure additional tunnels if the server provided them.
-	for t := 1; t < nt; t++ {
+	// Bring up, assign address, and configure WireGuard on ALL tunnel interfaces.
+	// Each interface gets the same IP address so the kernel knows how to reach
+	// the gateway (server WireGuard IP) through any of them.
+	for t := 0; t < nt; t++ {
 		link := c.tunnelLink(t)
 		err = netlink.LinkSetUp(link)
 		if err != nil {
 			return fmt.Errorf("error setting up vprox interface %s: %v", link.Name, err)
 		}
 
-		port := resp.Tunnels[t].ListenPort
+		// Assign the same address to every tunnel interface. The first call
+		// also updates c.wgCidr; subsequent calls for the same CIDR are
+		// handled by updateTunnelInterface which skips if already set.
+		if err := c.updateTunnelInterface(t, resp); err != nil {
+			return fmt.Errorf("error updating interface %s: %v", link.Name, err)
+		}
+
+		// Pick the listen port: tunnel 0 always uses ServerListenPort
+		// (backwards compatible with old servers); tunnels 1+ use Tunnels[t].
+		var port int
+		if t == 0 {
+			port = resp.ServerListenPort
+		} else {
+			port = resp.Tunnels[t].ListenPort
+		}
 		err = c.configureWireguardTunnel(t, resp, port)
 		if err != nil {
 			return fmt.Errorf("error configuring wireguard on %s: %v", c.tunnelIfname(t), err)
@@ -227,30 +223,33 @@ func (c *Client) Connect() error {
 	return nil
 }
 
-// updateInterface updates the primary WireGuard interface (tunnel 0) address
-// based on the connect response.
-func (c *Client) updateInterface(resp connectResponse) error {
+// updateTunnelInterface assigns the WireGuard address to tunnel interface t.
+// Every tunnel interface gets the same IP/CIDR so that the server gateway is
+// reachable through each of them (required for multipath routing).
+func (c *Client) updateTunnelInterface(t int, resp connectResponse) error {
 	cidr, err := netip.ParsePrefix(resp.AssignedAddr)
 	if err != nil {
 		return fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
 	}
 
-	if cidr != c.wgCidr {
-		link := c.link()
+	link := c.tunnelLink(t)
 
-		if c.wgCidr.IsValid() {
-			oldIpnet := prefixToIPNet(c.wgCidr)
-			err = netlink.AddrDel(link, &netlink.Addr{IPNet: &oldIpnet})
-			if err != nil {
-				log.Printf("warning: failed to remove old address from vprox interface when reconnecting: %v", err)
-			}
+	if t == 0 && c.wgCidr.IsValid() && cidr != c.wgCidr {
+		// On reconnect the primary tunnel may need the old address removed.
+		oldIpnet := prefixToIPNet(c.wgCidr)
+		if err := netlink.AddrDel(link, &netlink.Addr{IPNet: &oldIpnet}); err != nil {
+			log.Printf("warning: failed to remove old address from %s when reconnecting: %v", c.tunnelIfname(t), err)
 		}
+	}
 
-		ipnet := prefixToIPNet(cidr)
-		err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipnet})
-		if err != nil {
-			return fmt.Errorf("failed to add new address to vprox interface: %v", err)
-		}
+	ipnet := prefixToIPNet(cidr)
+	err = netlink.AddrReplace(link, &netlink.Addr{IPNet: &ipnet})
+	if err != nil {
+		return fmt.Errorf("failed to add address to %s: %v", c.tunnelIfname(t), err)
+	}
+
+	// Track the CIDR on the first tunnel.
+	if t == 0 {
 		c.wgCidr = cidr
 	}
 	return nil
