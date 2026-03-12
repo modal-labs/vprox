@@ -255,12 +255,10 @@ func (c *Client) updateTunnelInterface(t int, resp connectResponse) error {
 	return nil
 }
 
-// setupMultipathRouting creates equal-cost multipath routes across all active
-// tunnel interfaces so that the kernel distributes flows across them.
-//
-// WireGuard interfaces are POINTOPOINT and don't automatically get subnet
-// routes, so we first add a per-device route for each tunnel, then replace
-// them with a single multipath route.
+// setupMultipathRouting adds one equal-cost device-scoped route per tunnel
+// interface for the WireGuard subnet. The kernel automatically round-robins
+// across equal-cost routes to the same destination, distributing flows across
+// the tunnel interfaces.
 func (c *Client) setupMultipathRouting(nt int) error {
 	if !c.wgCidr.IsValid() {
 		return fmt.Errorf("no valid CIDR assigned yet")
@@ -268,7 +266,7 @@ func (c *Client) setupMultipathRouting(nt int) error {
 
 	subnetIPNet := prefixToIPNet(c.wgCidr.Masked())
 
-	// Step 1: Remove any existing routes for this subnet so we start clean.
+	// Remove any existing routes for this subnet so we start clean.
 	existingRoutes, _ := netlink.RouteList(nil, netlink.FAMILY_V4)
 	for i := range existingRoutes {
 		r := &existingRoutes[i]
@@ -277,65 +275,22 @@ func (c *Client) setupMultipathRouting(nt int) error {
 		}
 	}
 
-	// Step 2: Ensure each tunnel interface has a device-scoped route for the
-	// subnet. This makes the gateway reachable through every interface.
+	// Add a device-scoped route for each tunnel interface. Equal-cost routes
+	// to the same destination cause the kernel to distribute flows across them.
 	for t := 0; t < nt; t++ {
 		ifname := c.tunnelIfname(t)
 		link, err := netlink.LinkByName(ifname)
 		if err != nil {
 			return fmt.Errorf("failed to find interface %s: %v", ifname, err)
 		}
-		devRoute := &netlink.Route{
+		route := &netlink.Route{
 			LinkIndex: link.Attrs().Index,
 			Dst:       &subnetIPNet,
 			Scope:     netlink.SCOPE_LINK,
 		}
-		if err := netlink.RouteReplace(devRoute); err != nil {
-			return fmt.Errorf("failed to add device route on %s: %v", ifname, err)
+		if err := netlink.RouteAdd(route); err != nil {
+			return fmt.Errorf("failed to add route on %s: %v", ifname, err)
 		}
-	}
-
-	// Step 3: Build multipath nexthops — one per tunnel interface, using the
-	// server's WireGuard IP (first address in subnet) as the gateway. Now
-	// that each interface has a device-scoped route, the gateway is reachable
-	// through all of them.
-	gwAddr := c.wgCidr.Masked().Addr().Next()
-	gwIP := addrToIp(gwAddr)
-
-	var nexthops []*netlink.NexthopInfo
-	for t := 0; t < nt; t++ {
-		ifname := c.tunnelIfname(t)
-		link, err := netlink.LinkByName(ifname)
-		if err != nil {
-			return fmt.Errorf("failed to find interface %s: %v", ifname, err)
-		}
-		nexthops = append(nexthops, &netlink.NexthopInfo{
-			LinkIndex: link.Attrs().Index,
-			Gw:        gwIP,
-			Hops:      0, // equal weight
-		})
-	}
-
-	// Step 4: Remove the per-device routes and replace with a single
-	// multipath route.
-	for t := 0; t < nt; t++ {
-		ifname := c.tunnelIfname(t)
-		link, _ := netlink.LinkByName(ifname)
-		if link != nil {
-			_ = netlink.RouteDel(&netlink.Route{
-				LinkIndex: link.Attrs().Index,
-				Dst:       &subnetIPNet,
-				Scope:     netlink.SCOPE_LINK,
-			})
-		}
-	}
-
-	mpRoute := &netlink.Route{
-		Dst:       &subnetIPNet,
-		MultiPath: nexthops,
-	}
-	if err := netlink.RouteReplace(mpRoute); err != nil {
-		return fmt.Errorf("failed to add multipath route: %v", err)
 	}
 
 	return nil
