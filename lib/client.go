@@ -40,12 +40,15 @@ func IsRecoverableError(err error) bool {
 	return true
 }
 
-// Client manages a peering connection with with a local WireGuard interface.
+// Client manages a peering connection with a local WireGuard interface (or a
+// set of parallel WireGuard interfaces when multi-tunnel is enabled).
 type Client struct {
 	// Key is the private key of the client.
 	Key wgtypes.Key
 
-	// Ifname is the name of the client WireGuard interface.
+	// Ifname is the base name of the client WireGuard interface (e.g. "vprox0").
+	// With multi-tunnel this becomes the primary interface; additional tunnels
+	// are named "vprox0t1", "vprox0t2", etc.
 	Ifname string
 
 	// ServerIp is the public IPv4 address of the server.
@@ -53,6 +56,10 @@ type Client struct {
 
 	// Password authenticates the client connection.
 	Password string
+
+	// NumTunnels is the number of parallel WireGuard tunnels to create.
+	// When <= 1, the client behaves exactly as before (single interface).
+	NumTunnels int
 
 	// WgClient is a shared client for interacting with the WireGuard kernel module.
 	WgClient *wgctrl.Client
@@ -62,45 +69,120 @@ type Client struct {
 
 	// wgCidr is the current subnet assigned to the WireGuard interface, if any.
 	wgCidr netip.Prefix
+
+	// activeTunnels tracks how many tunnel interfaces were actually created
+	// during the last successful Connect(). This may be less than NumTunnels
+	// if the server returned fewer Tunnels entries (e.g. old server).
+	activeTunnels int
 }
 
-// CreateInterface creates a new interface for wireguard. DeleteInterface() needs
-// to be called to clean this up.
+// numTunnels returns the effective tunnel count, defaulting to 1.
+func (c *Client) numTunnels() int {
+	if c.NumTunnels <= 1 {
+		return 1
+	}
+	return c.NumTunnels
+}
+
+// tunnelIfname returns the interface name for the t-th tunnel.
+// Tunnel 0 uses Ifname directly (e.g. "vprox0").
+// Tunnel 1+ appends "t1", "t2", etc. (e.g. "vprox0t1", "vprox0t2").
+func (c *Client) tunnelIfname(t int) string {
+	if t == 0 {
+		return c.Ifname
+	}
+	return fmt.Sprintf("%st%d", c.Ifname, t)
+}
+
+// tunnelLink builds a linkWireguard for the t-th tunnel with tuned LinkAttrs.
+func (c *Client) tunnelLink(t int) *linkWireguard {
+	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{
+		Name:        c.tunnelIfname(t),
+		MTU:         WireguardMTU,
+		TxQLen:      WireguardTxQLen,
+		NumTxQueues: WireguardNumQueues,
+		NumRxQueues: WireguardNumQueues,
+		GSOMaxSize:  WireguardGSOMaxSize,
+		GROMaxSize:  WireguardGSOMaxSize,
+	}}
+}
+
+// link returns a linkWireguard for the primary (tunnel 0) interface.
+func (c *Client) link() *linkWireguard {
+	return c.tunnelLink(0)
+}
+
+// CreateInterface creates the WireGuard interface(s). For single-tunnel mode
+// this creates one interface; for multi-tunnel mode it creates N interfaces.
+// DeleteInterface() must be called to clean up.
 func (c *Client) CreateInterface() error {
-	link := c.link()
+	nt := c.numTunnels()
+	for t := 0; t < nt; t++ {
+		if err := c.createTunnelInterface(t); err != nil {
+			// Clean up any interfaces we already created.
+			for rb := 0; rb < t; rb++ {
+				c.deleteTunnelInterface(rb)
+			}
+			return err
+		}
+	}
+	if nt > 1 {
+		log.Printf("created %d tunnel interfaces (%s .. %s)", nt, c.tunnelIfname(0), c.tunnelIfname(nt-1))
+	}
+	return nil
+}
+
+// createTunnelInterface creates a single WireGuard tunnel interface.
+func (c *Client) createTunnelInterface(t int) error {
+	link := c.tunnelLink(t)
 
 	err := netlink.LinkAdd(link)
 	if err != nil {
-		return fmt.Errorf("error creating vprox interface: %v", err)
+		return fmt.Errorf("error creating vprox interface %s: %v", link.Name, err)
 	}
 
-	// Set MTU explicitly for optimal throughput (matching server-side WireguardMTU)
-	err = netlink.LinkSetMTU(link, 1420)
+	// Set MTU explicitly (some kernels ignore LinkAttrs.MTU on creation)
+	err = netlink.LinkSetMTU(link, WireguardMTU)
 	if err != nil {
 		netlink.LinkDel(link)
-		return fmt.Errorf("error setting MTU on vprox interface: %v", err)
+		return fmt.Errorf("error setting MTU on vprox interface %s: %v", link.Name, err)
 	}
 
-	// Set TxQLen for improved burst handling (matching server-side WireguardTxQLen)
-	err = netlink.LinkSetTxQLen(link, 1000)
+	// Set TxQLen for improved burst handling
+	err = netlink.LinkSetTxQLen(link, WireguardTxQLen)
 	if err != nil {
 		// Non-fatal: log warning but continue
-		log.Printf("warning: failed to set TxQLen on vprox interface: %v", err)
+		log.Printf("warning: failed to set TxQLen on vprox interface %s: %v", link.Name, err)
 	}
 
 	return nil
 }
 
-// Connect attempts to reconnect to the peer. A network interface needs to
-// have already been created with CreateInterface() before calling Connect()
+// Connect attempts to connect (or reconnect) to the server. All tunnel
+// interfaces must already exist via CreateInterface().
 func (c *Client) Connect() error {
 	resp, err := c.sendConnectionRequest()
 	if err != nil {
 		return err
 	}
 
-	link := c.link()
-	err = netlink.LinkSetUp(link)
+	// Determine how many tunnels to actually use. Use the minimum of what
+	// the client wants and what the server offers.
+	nt := c.numTunnels()
+	serverTunnels := len(resp.Tunnels)
+	if serverTunnels > 0 && serverTunnels < nt {
+		nt = serverTunnels
+	}
+	// If the server returned no Tunnels list (old server), use 1 tunnel.
+	if serverTunnels == 0 {
+		nt = 1
+	}
+	c.activeTunnels = nt
+
+	// Bring up and configure the primary interface (tunnel 0) — this is the
+	// one that gets the IP address and subnet route.
+	primaryLink := c.tunnelLink(0)
+	err = netlink.LinkSetUp(primaryLink)
 	if err != nil {
 		return fmt.Errorf("error setting up vprox interface: %v", err)
 	}
@@ -110,15 +192,43 @@ func (c *Client) Connect() error {
 		return err
 	}
 
-	err = c.configureWireguard(resp)
+	// Configure WireGuard on tunnel 0 using the primary ServerListenPort
+	// (works for both old and new servers).
+	err = c.configureWireguardTunnel(0, resp, resp.ServerListenPort)
 	if err != nil {
-		return fmt.Errorf("error configuring wireguard interface: %v", err)
+		return fmt.Errorf("error configuring wireguard on %s: %v", c.tunnelIfname(0), err)
+	}
+
+	// Configure additional tunnels if the server provided them.
+	for t := 1; t < nt; t++ {
+		link := c.tunnelLink(t)
+		err = netlink.LinkSetUp(link)
+		if err != nil {
+			return fmt.Errorf("error setting up vprox interface %s: %v", link.Name, err)
+		}
+
+		port := resp.Tunnels[t].ListenPort
+		err = c.configureWireguardTunnel(t, resp, port)
+		if err != nil {
+			return fmt.Errorf("error configuring wireguard on %s: %v", c.tunnelIfname(t), err)
+		}
+	}
+
+	// Set up multipath routing if we have multiple active tunnels.
+	if nt > 1 {
+		if err := c.setupMultipathRouting(nt); err != nil {
+			log.Printf("warning: failed to set up multipath routing: %v", err)
+			// Fall back: traffic will just use the primary interface's route.
+		} else {
+			log.Printf("multipath routing configured across %d tunnels", nt)
+		}
 	}
 
 	return nil
 }
 
-// updateInterface updates the wireguard interface based on the provided connectionResponse
+// updateInterface updates the primary WireGuard interface (tunnel 0) address
+// based on the connect response.
 func (c *Client) updateInterface(resp connectResponse) error {
 	cidr, err := netip.ParsePrefix(resp.AssignedAddr)
 	if err != nil {
@@ -131,7 +241,6 @@ func (c *Client) updateInterface(resp connectResponse) error {
 		if c.wgCidr.IsValid() {
 			oldIpnet := prefixToIPNet(c.wgCidr)
 			err = netlink.AddrDel(link, &netlink.Addr{IPNet: &oldIpnet})
-
 			if err != nil {
 				log.Printf("warning: failed to remove old address from vprox interface when reconnecting: %v", err)
 			}
@@ -144,6 +253,59 @@ func (c *Client) updateInterface(resp connectResponse) error {
 		}
 		c.wgCidr = cidr
 	}
+	return nil
+}
+
+// setupMultipathRouting creates equal-cost multipath routes across all active
+// tunnel interfaces so that the kernel distributes flows across them.
+func (c *Client) setupMultipathRouting(nt int) error {
+	if !c.wgCidr.IsValid() {
+		return fmt.Errorf("no valid CIDR assigned yet")
+	}
+
+	// The server's WireGuard IP is the first address in the subnet (the
+	// gateway for our multipath nexthops).
+	gwAddr := c.wgCidr.Masked().Addr().Next()
+	gwIP := addrToIp(gwAddr)
+
+	// Build multipath nexthops — one per tunnel interface.
+	var nexthops []*netlink.NexthopInfo
+	for t := 0; t < nt; t++ {
+		ifname := c.tunnelIfname(t)
+		link, err := netlink.LinkByName(ifname)
+		if err != nil {
+			return fmt.Errorf("failed to find interface %s: %v", ifname, err)
+		}
+		nexthops = append(nexthops, &netlink.NexthopInfo{
+			LinkIndex: link.Attrs().Index,
+			Gw:        gwIP,
+			Hops:      0, // equal weight
+		})
+	}
+
+	// Remove any existing default route on the primary interface first.
+	// (The kernel creates one when we assign the address.)
+	existingRoutes, _ := netlink.RouteList(nil, netlink.FAMILY_V4)
+	for i := range existingRoutes {
+		r := &existingRoutes[i]
+		if r.Dst != nil && r.Dst.String() == c.wgCidr.Masked().String() {
+			// This is the subnet route — we need to replace it with multipath.
+			_ = netlink.RouteDel(r)
+		}
+	}
+
+	// Add the multipath route for the WireGuard subnet.
+	subnetIPNet := prefixToIPNet(c.wgCidr.Masked())
+	route := &netlink.Route{
+		Dst:       &subnetIPNet,
+		MultiPath: nexthops,
+	}
+
+	err := netlink.RouteReplace(route)
+	if err != nil {
+		return fmt.Errorf("failed to add multipath route: %v", err)
+	}
+
 	return nil
 }
 
@@ -195,15 +357,17 @@ func (c *Client) sendConnectionRequest() (connectResponse, error) {
 	return respJson, nil
 }
 
-// configureWireguard configures the WireGuard peer.
-func (c *Client) configureWireguard(connectionResponse connectResponse) error {
-	serverPublicKey, err := wgtypes.ParseKey(connectionResponse.ServerPublicKey)
+// configureWireguardTunnel configures a single WireGuard tunnel interface with
+// the server as a peer on the given port.
+func (c *Client) configureWireguardTunnel(t int, resp connectResponse, serverPort int) error {
+	serverPublicKey, err := wgtypes.ParseKey(resp.ServerPublicKey)
 	if err != nil {
 		return fmt.Errorf("failed to parse server public key: %v", err)
 	}
 
 	keepalive := 25 * time.Second
-	return c.WgClient.ConfigureDevice(c.Ifname, wgtypes.Config{
+	ifname := c.tunnelIfname(t)
+	return c.WgClient.ConfigureDevice(ifname, wgtypes.Config{
 		PrivateKey:   &c.Key,
 		ReplacePeers: true,
 		Peers: []wgtypes.PeerConfig{
@@ -211,7 +375,7 @@ func (c *Client) configureWireguard(connectionResponse connectResponse) error {
 				PublicKey: serverPublicKey,
 				Endpoint: &net.UDPAddr{
 					IP:   addrToIp(c.ServerIp),
-					Port: connectionResponse.ServerListenPort,
+					Port: serverPort,
 				},
 				PersistentKeepaliveInterval: &keepalive,
 				ReplaceAllowedIPs:           true,
@@ -222,6 +386,11 @@ func (c *Client) configureWireguard(connectionResponse connectResponse) error {
 			},
 		},
 	})
+}
+
+// configureWireguard configures WireGuard on the primary tunnel (backwards compat).
+func (c *Client) configureWireguard(connectionResponse connectResponse) error {
+	return c.configureWireguardTunnel(0, connectionResponse, connectionResponse.ServerListenPort)
 }
 
 // Disconnect notifies the server that this client is disconnecting, allowing the
@@ -264,32 +433,31 @@ func (c *Client) Disconnect() error {
 	return nil
 }
 
+// DeleteInterface removes all WireGuard tunnel interfaces.
 func (c *Client) DeleteInterface() {
-	// Delete the WireGuard interface.
-	log.Printf("About to delete vprox interface %v", c.Ifname)
-	err := netlink.LinkDel(c.link())
-	if err != nil {
-		log.Printf("error deleting vprox interface %v: %v", c.Ifname, err)
-	} else {
-		log.Printf("successfully deleted vprox interface %v", c.Ifname)
+	nt := c.numTunnels()
+	for t := nt - 1; t >= 0; t-- {
+		c.deleteTunnelInterface(t)
 	}
 }
 
-func (c *Client) link() *linkWireguard {
-	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{
-		Name:        c.Ifname,
-		MTU:         1420,
-		TxQLen:      1000,
-		NumTxQueues: 4,
-		NumRxQueues: 4,
-		GSOMaxSize:  65536,
-		GROMaxSize:  65536,
-	}}
+// deleteTunnelInterface removes a single WireGuard tunnel interface.
+func (c *Client) deleteTunnelInterface(t int) {
+	ifname := c.tunnelIfname(t)
+	log.Printf("About to delete vprox interface %v", ifname)
+	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
+	err := netlink.LinkDel(link)
+	if err != nil {
+		log.Printf("error deleting vprox interface %v: %v", ifname, err)
+	} else {
+		log.Printf("successfully deleted vprox interface %v", ifname)
+	}
 }
 
 // CheckConnection checks the status of the connection with the wireguard peer,
 // and returns true if it is healthy. This sends 3 pings in succession, and blocks
 // until they receive a response or the timeout passes.
+// Pings are sent through the primary tunnel interface (tunnel 0).
 func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Context) bool {
 	pinger, err := probing.NewPinger(c.wgCidr.Masked().Addr().Next().String())
 	if err != nil {
@@ -301,7 +469,7 @@ func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Contex
 	pinger.Timeout = timeout
 	pinger.Count = 3
 	pinger.Interval = 10 * time.Millisecond // Send approximately all at once
-	err = pinger.RunWithContext(cancelCtx)  // Blocks until finished.
+	err = pinger.RunWithContext(cancelCtx)   // Blocks until finished.
 	if err != nil {
 		log.Printf("error running pinger: %v", err)
 		return false

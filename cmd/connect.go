@@ -68,12 +68,15 @@ var ConnectCmd = &cobra.Command{
 }
 
 var connectCmdArgs struct {
-	ifname string
+	ifname  string
+	tunnels int
 }
 
 func init() {
 	ConnectCmd.Flags().StringVar(&connectCmdArgs.ifname, "interface",
 		"vprox0", "Interface name to proxy traffic through the VPN")
+	ConnectCmd.Flags().IntVar(&connectCmdArgs.tunnels, "tunnels",
+		1, "Number of parallel WireGuard tunnels (higher values improve throughput by spreading traffic across NIC queues)")
 }
 
 func runConnect(cmd *cobra.Command, args []string) error {
@@ -98,11 +101,12 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}
 
 	client := &lib.Client{
-		Key:      key,
-		Ifname:   connectCmdArgs.ifname,
-		ServerIp: serverIp,
-		Password: password,
-		WgClient: wgClient,
+		Key:        key,
+		Ifname:     connectCmdArgs.ifname,
+		ServerIp:   serverIp,
+		Password:   password,
+		NumTunnels: connectCmdArgs.tunnels,
+		WgClient:   wgClient,
 		Http: &http.Client{
 			Timeout: 5 * time.Second,
 			Transport: &http.Transport{
