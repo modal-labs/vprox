@@ -540,6 +540,14 @@ func (srv *Server) StartWireguard() error {
 	if nt > 1 {
 		log.Printf("[%v] started %d WireGuard tunnels (ports %d..%d)",
 			srv.BindAddr, nt, srv.tunnelListenPort(0), srv.tunnelListenPort(nt-1))
+
+		// Set up equal-cost routes across all tunnel interfaces so the kernel
+		// distributes reply traffic across them (same approach as client side).
+		if err := srv.setupMultipathRouting(nt); err != nil {
+			log.Printf("[%v] warning: failed to set up multipath routing: %v", srv.BindAddr, err)
+		} else {
+			log.Printf("[%v] multipath routing configured across %d tunnels", srv.BindAddr, nt)
+		}
 	}
 	return nil
 }
@@ -594,23 +602,20 @@ func (srv *Server) startWireguardTunnel(t int) error {
 }
 
 // createFreshInterface creates and configures a new WireGuard interface.
-// Only tunnel 0 gets an IP address assigned — the other tunnels share the same
-// subnet via the kernel routing table entry that tunnel 0 creates.
+// Every tunnel interface gets the same subnet IP so the kernel can route
+// reply packets back through any of them.
 func (srv *Server) createFreshInterface(link *linkWireguard, tunnelIndex int) error {
 	err := netlink.LinkAdd(link)
 	if err != nil {
 		return fmt.Errorf("failed to create WireGuard device %s: %v", link.Name, err)
 	}
 
-	// Only the primary tunnel (index 0) gets the subnet IP address.
-	// Additional tunnels participate in the same subnet without their own address.
-	if tunnelIndex == 0 {
-		ipnet := prefixToIPNet(srv.WgCidr)
-		err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipnet})
-		if err != nil {
-			netlink.LinkDel(link)
-			return fmt.Errorf("failed to add address to WireGuard device %s: %v", link.Name, err)
-		}
+	// Assign the subnet IP to every tunnel interface.
+	ipnet := prefixToIPNet(srv.WgCidr)
+	err = netlink.AddrReplace(link, &netlink.Addr{IPNet: &ipnet})
+	if err != nil {
+		netlink.LinkDel(link)
+		return fmt.Errorf("failed to add address to WireGuard device %s: %v", link.Name, err)
 	}
 
 	// Set MTU explicitly after link creation (some kernels ignore it in LinkAttrs)
@@ -632,6 +637,40 @@ func (srv *Server) createFreshInterface(link *linkWireguard, tunnelIndex int) er
 		return fmt.Errorf("failed to bring up WireGuard device %s: %v", link.Name, err)
 	}
 
+	return nil
+}
+
+// setupMultipathRouting adds equal-cost device-scoped routes for the WireGuard
+// subnet across all tunnel interfaces so the kernel round-robins reply traffic.
+func (srv *Server) setupMultipathRouting(nt int) error {
+	subnetIPNet := prefixToIPNet(srv.WgCidr.Masked())
+
+	// Remove any existing routes for this subnet so we start clean.
+	existingRoutes, _ := netlink.RouteList(nil, netlink.FAMILY_V4)
+	for i := range existingRoutes {
+		r := &existingRoutes[i]
+		if r.Dst != nil && r.Dst.String() == subnetIPNet.String() {
+			_ = netlink.RouteDel(r)
+		}
+	}
+
+	// Append one route per tunnel interface. Equal-cost routes to the same
+	// destination cause the kernel to distribute flows across them.
+	for t := 0; t < nt; t++ {
+		ifname := srv.TunnelIfname(t)
+		link, err := netlink.LinkByName(ifname)
+		if err != nil {
+			return fmt.Errorf("failed to find interface %s: %v", ifname, err)
+		}
+		route := &netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       &subnetIPNet,
+			Scope:     netlink.SCOPE_LINK,
+		}
+		if err := netlink.RouteAppend(route); err != nil {
+			return fmt.Errorf("failed to append route on %s: %v", ifname, err)
+		}
+	}
 	return nil
 }
 
