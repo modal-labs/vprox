@@ -262,7 +262,15 @@ func (c *Client) DeleteInterface() {
 }
 
 func (c *Client) link() *linkWireguard {
-	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: c.Ifname}}
+	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{
+		Name:        c.Ifname,
+		MTU:         1420,
+		TxQLen:      1000,
+		NumTxQueues: 4,
+		NumRxQueues: 4,
+		GSOMaxSize:  65536,
+		GROMaxSize:  65536,
+	}}
 }
 
 // CheckConnection checks the status of the connection with the wireguard peer,
