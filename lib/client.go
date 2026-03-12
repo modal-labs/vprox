@@ -20,13 +20,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// PolicyRoutingTable is the custom routing table number used for multi-tunnel
-// multipath routing. Traffic from the vprox IP is redirected here via an
-// ip rule, and this table contains equal-cost routes across all tunnels.
-const PolicyRoutingTable = 51820
 
-// PolicyRoutingPriority is the ip rule priority for the vprox policy route.
-const PolicyRoutingPriority = 100
 
 // Used to determine if we can recover from an error during connection setup.
 type ConnectionError struct {

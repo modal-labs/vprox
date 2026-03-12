@@ -25,6 +25,13 @@ import (
 // FwmarkBase is the base value for firewall marks used by vprox.
 const FwmarkBase = 0x54437D00
 
+// PolicyRoutingTable is the custom routing table number used for multi-tunnel
+// multipath routing on both server and client.
+const PolicyRoutingTable = 51820
+
+// PolicyRoutingPriority is the ip rule priority for the vprox policy route.
+const PolicyRoutingPriority = 100
+
 // UDP listen port base value for WireGuard connections.
 const WireguardListenPortBase = 50227
 
@@ -541,12 +548,11 @@ func (srv *Server) StartWireguard() error {
 		log.Printf("[%v] started %d WireGuard tunnels (ports %d..%d)",
 			srv.BindAddr, nt, srv.tunnelListenPort(0), srv.tunnelListenPort(nt-1))
 
-		// Set up equal-cost routes across all tunnel interfaces so the kernel
-		// distributes reply traffic across them (same approach as client side).
-		if err := srv.setupMultipathRouting(nt); err != nil {
-			log.Printf("[%v] warning: failed to set up multipath routing: %v", srv.BindAddr, err)
+		// Set up policy routing so reply traffic is distributed across tunnels.
+		if err := srv.setupPolicyRouting(nt); err != nil {
+			log.Printf("[%v] warning: failed to set up policy routing: %v", srv.BindAddr, err)
 		} else {
-			log.Printf("[%v] multipath routing configured across %d tunnels", srv.BindAddr, nt)
+			log.Printf("[%v] policy routing configured across %d tunnels", srv.BindAddr, nt)
 		}
 	}
 	return nil
@@ -640,41 +646,90 @@ func (srv *Server) createFreshInterface(link *linkWireguard, tunnelIndex int) er
 	return nil
 }
 
-// setupMultipathRouting adds equal-cost device-scoped routes for the WireGuard
-// subnet across all tunnel interfaces so the kernel round-robins reply traffic.
-func (srv *Server) setupMultipathRouting(nt int) error {
+// setupPolicyRouting creates:
+//  1. Multipath routes in a custom routing table across all WireGuard tunnels.
+//  2. An ip rule that matches traffic from the server's WireGuard IP and directs
+//     it to that custom table.
+//
+// This ensures reply traffic from the server is distributed across all tunnels
+// by the kernel's L4 flow hash, not just sent through tunnel 0.
+func (srv *Server) setupPolicyRouting(nt int) error {
+	// Build multipath nexthops — one per tunnel interface. We use the subnet
+	// as the destination (not default) since the server only needs to reach
+	// the WireGuard peer subnet via these tunnels.
 	subnetIPNet := prefixToIPNet(srv.WgCidr.Masked())
 
-	// Remove any existing routes for this subnet so we start clean.
-	existingRoutes, _ := netlink.RouteList(nil, netlink.FAMILY_V4)
-	for i := range existingRoutes {
-		r := &existingRoutes[i]
-		if r.Dst != nil && r.Dst.String() == subnetIPNet.String() {
-			_ = netlink.RouteDel(r)
-		}
-	}
-
-	// Append one route per tunnel interface. Equal-cost routes to the same
-	// destination cause the kernel to distribute flows across them.
+	var nexthops []*netlink.NexthopInfo
 	for t := 0; t < nt; t++ {
 		ifname := srv.TunnelIfname(t)
 		link, err := netlink.LinkByName(ifname)
 		if err != nil {
 			return fmt.Errorf("failed to find interface %s: %v", ifname, err)
 		}
-		route := &netlink.Route{
+		nexthops = append(nexthops, &netlink.NexthopInfo{
 			LinkIndex: link.Attrs().Index,
-			Dst:       &subnetIPNet,
-			Scope:     netlink.SCOPE_LINK,
-		}
-		if err := netlink.RouteAppend(route); err != nil {
-			return fmt.Errorf("failed to append route on %s: %v", ifname, err)
-		}
+			Hops:      0,
+		})
 	}
+
+	// Add the multipath route in custom table.
+	mpRoute := &netlink.Route{
+		Table:     PolicyRoutingTable,
+		Dst:       &subnetIPNet,
+		MultiPath: nexthops,
+		Scope:     netlink.SCOPE_LINK,
+	}
+	if err := netlink.RouteReplace(mpRoute); err != nil {
+		return fmt.Errorf("failed to add multipath route to table %d: %v", PolicyRoutingTable, err)
+	}
+
+	// Add an ip rule: from <server wg ip> lookup custom table.
+	srcIP := srv.WgCidr.Addr()
+	srcNet := &net.IPNet{
+		IP:   addrToIp(srcIP),
+		Mask: net.CIDRMask(32, 32),
+	}
+	rule := netlink.NewRule()
+	rule.Src = srcNet
+	rule.Table = PolicyRoutingTable
+	rule.Priority = PolicyRoutingPriority
+
+	// Remove any stale rule first (idempotent).
+	_ = netlink.RuleDel(rule)
+
+	if err := netlink.RuleAdd(rule); err != nil {
+		return fmt.Errorf("failed to add ip rule for %v: %v", srcIP, err)
+	}
+
 	return nil
 }
 
-// CleanupWireguard removes all tunnel WireGuard interfaces.
+// cleanupPolicyRouting removes the ip rule and flushes the custom routing table.
+func (srv *Server) cleanupPolicyRouting() {
+	srcIP := srv.WgCidr.Addr()
+	srcNet := &net.IPNet{
+		IP:   addrToIp(srcIP),
+		Mask: net.CIDRMask(32, 32),
+	}
+	rule := netlink.NewRule()
+	rule.Src = srcNet
+	rule.Table = PolicyRoutingTable
+	rule.Priority = PolicyRoutingPriority
+	if err := netlink.RuleDel(rule); err != nil {
+		log.Printf("warning: failed to delete ip rule: %v", err)
+	}
+
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{
+		Table: PolicyRoutingTable,
+	}, netlink.RT_FILTER_TABLE)
+	if err == nil {
+		for i := range routes {
+			_ = netlink.RouteDel(&routes[i])
+		}
+	}
+}
+
+// CleanupWireguard removes all tunnel WireGuard interfaces and policy routing.
 func (srv *Server) CleanupWireguard() {
 	srv.mu.Lock()
 	relinquished := srv.relinquished
@@ -686,6 +741,11 @@ func (srv *Server) CleanupWireguard() {
 	}
 
 	log.Printf("[%v] cleaning up WireGuard state", srv.BindAddr)
+
+	if srv.numTunnels() > 1 {
+		srv.cleanupPolicyRouting()
+	}
+
 	nt := srv.numTunnels()
 	for t := 0; t < nt; t++ {
 		srv.cleanupWireguardTunnel(t)
