@@ -29,6 +29,7 @@ var serverCmdArgs struct {
 	wgBlockPerIp string
 	cloud        string
 	takeover     bool
+	tunnels      int
 }
 
 func init() {
@@ -42,6 +43,8 @@ func init() {
 		"", "Cloud provider for IP metadata (watches for changes)")
 	ServerCmd.Flags().BoolVar(&serverCmdArgs.takeover, "takeover",
 		false, "Take over existing WireGuard state from a previous server instance (for non-disruptive upgrades)")
+	ServerCmd.Flags().IntVar(&serverCmdArgs.tunnels, "tunnels",
+		1, "Number of parallel WireGuard tunnels per IP (higher values improve throughput by spreading traffic across NIC queues)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
@@ -98,9 +101,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if serverCmdArgs.tunnels < 1 || serverCmdArgs.tunnels > lib.MaxTunnelsPerServer {
+		return fmt.Errorf("--tunnels must be between 1 and %d", lib.MaxTunnelsPerServer)
+	}
+
 	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, password, serverCmdArgs.takeover)
+	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, password, serverCmdArgs.tunnels, serverCmdArgs.takeover)
 	if err != nil {
 		done()
 		return err

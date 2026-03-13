@@ -25,8 +25,45 @@ import (
 // FwmarkBase is the base value for firewall marks used by vprox.
 const FwmarkBase = 0x54437D00
 
+// PolicyRoutingTable is the custom routing table number used for multi-tunnel
+// multipath routing on both server and client.
+const PolicyRoutingTable = 51820
+
+// PolicyRoutingPriority is the ip rule priority for the vprox policy route.
+const PolicyRoutingPriority = 100
+
 // UDP listen port base value for WireGuard connections.
 const WireguardListenPortBase = 50227
+
+// WireGuard interface MTU. WireGuard adds ~60 bytes overhead (40 for IPv4/UDP
+// + 16 for WG header + padding). Setting MTU to 1420 prevents fragmentation
+// on standard 1500 MTU networks.
+const WireguardMTU = 1420
+
+// WireGuard interface transmit queue length. Higher values reduce packet drops
+// during traffic bursts.
+const WireguardTxQLen = 1000
+
+// GSO/GRO max size for improved throughput on Linux 5.19+. Allows the kernel
+// to batch packets into large 64 KB super-packets before encryption/decryption.
+const WireguardGSOMaxSize = 65536
+
+// TCP MSS for traffic through the WireGuard tunnel, calculated as
+// MTU (1420) - IP header (20) - TCP header (20) = 1380.
+const WireguardMSS = 1380
+
+// Number of TX/RX queues for parallel packet processing on multi-core systems.
+const WireguardNumQueues = 4
+
+// MaxTunnelsPerServer is the maximum number of parallel WireGuard tunnels
+// allowed per server (per bind IP). Each tunnel uses a different UDP port
+// so that the NIC hashes them to different hardware RX queues.
+const MaxTunnelsPerServer = 16
+
+// PortsPerIndex is the number of UDP ports reserved per server index.
+// This must be >= MaxTunnelsPerServer. With this spacing, server index 0
+// uses ports 50227..50242, index 1 uses 50243..50258, etc.
+const PortsPerIndex = MaxTunnelsPerServer
 
 // A new peer must connect with a handshake within this time.
 const FirstHandshakeTimeout = 10 * time.Second
@@ -68,6 +105,12 @@ type Server struct {
 	// Index is a unique server index for firewall marks and other uses. It starts at 0.
 	Index uint16
 
+	// NumTunnels is the number of parallel WireGuard tunnels to create for
+	// this server. Each tunnel listens on a different UDP port so that the NIC
+	// hashes them to different hardware RX queues, increasing throughput beyond
+	// the single-flow limit. Defaults to 1 for backwards compatibility.
+	NumTunnels int
+
 	// Ipt is the iptables client for managing firewall rules.
 	Ipt *iptables.IPTables
 
@@ -92,6 +135,17 @@ type Server struct {
 	// takeover indicates this server should take over existing WireGuard state
 	// instead of creating a fresh interface. Used for non-disruptive upgrades.
 	takeover bool
+}
+
+// numTunnels returns the effective tunnel count, defaulting to 1.
+func (srv *Server) numTunnels() int {
+	if srv.NumTunnels <= 0 {
+		return 1
+	}
+	if srv.NumTunnels > MaxTunnelsPerServer {
+		return MaxTunnelsPerServer
+	}
+	return srv.NumTunnels
 }
 
 // InitState initializes the private server state.
@@ -177,10 +231,25 @@ func (srv *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
 type connectRequest struct {
 	PeerPublicKey string
 }
+
+// TunnelInfo describes a single WireGuard tunnel endpoint within a multi-tunnel
+// connection. Clients that support multi-tunnel will use these to set up
+// parallel WireGuard interfaces.
+type TunnelInfo struct {
+	ListenPort int    `json:"ListenPort"`
+	Ifname     string `json:"Ifname"`
+}
+
 type connectResponse struct {
 	AssignedAddr     string
 	ServerPublicKey  string
 	ServerListenPort int
+
+	// Tunnels lists all available tunnel endpoints for this server. Clients
+	// that support multi-tunnel create one WireGuard interface per entry.
+	// Clients that don't understand this field will fall back to the single
+	// ServerListenPort above (backwards compatible).
+	Tunnels []TunnelInfo `json:"Tunnels,omitempty"`
 }
 
 // Handle a new connection.
@@ -242,31 +311,56 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
 	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
-	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
-		Peers: []wgtypes.PeerConfig{
-			{
-				PublicKey:         peerKey,
-				ReplaceAllowedIPs: true,
-				AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
-			},
-		},
-	})
-	if err != nil {
-		srv.mu.Lock()
-		delete(srv.allPeers, peerKey)
-		srv.mu.Unlock()
 
-		srv.ipAllocator.Free(peerIp)
-		log.Printf("failed to configure WireGuard peer: %v", err)
-		http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
-		return
+	// Add the peer to ALL tunnel interfaces so that traffic arriving on any
+	// tunnel is accepted, and the server can send traffic back on any tunnel.
+	nt := srv.numTunnels()
+	for t := 0; t < nt; t++ {
+		ifname := srv.TunnelIfname(t)
+		err = srv.WgClient.ConfigureDevice(ifname, wgtypes.Config{
+			Peers: []wgtypes.PeerConfig{
+				{
+					PublicKey:         peerKey,
+					ReplaceAllowedIPs: true,
+					AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
+				},
+			},
+		})
+		if err != nil {
+			// Roll back: remove from any interfaces we already configured.
+			for rb := 0; rb < t; rb++ {
+				rbIfname := srv.TunnelIfname(rb)
+				_ = srv.WgClient.ConfigureDevice(rbIfname, wgtypes.Config{
+					Peers: []wgtypes.PeerConfig{{PublicKey: peerKey, Remove: true}},
+				})
+			}
+
+			srv.mu.Lock()
+			delete(srv.allPeers, peerKey)
+			srv.mu.Unlock()
+			srv.ipAllocator.Free(peerIp)
+
+			log.Printf("failed to configure WireGuard peer on %s: %v", ifname, err)
+			http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Build the Tunnels list for multi-tunnel clients.
+	tunnels := make([]TunnelInfo, nt)
+	for t := 0; t < nt; t++ {
+		tunnels[t] = TunnelInfo{
+			ListenPort: srv.tunnelListenPort(t),
+			Ifname:     srv.TunnelIfname(t),
+		}
 	}
 
 	// Return the assigned IP address and the server's public key.
 	resp := &connectResponse{
 		AssignedAddr:     fmt.Sprintf("%v/%d", peerIp, srv.WgCidr.Bits()),
 		ServerPublicKey:  srv.Key.PublicKey().String(),
-		ServerListenPort: WireguardListenPortBase + int(srv.Index),
+		ServerListenPort: srv.tunnelListenPort(0), // primary tunnel for old clients
+		Tunnels:          tunnels,
 	}
 
 	respBuf, err := json.Marshal(resp)
@@ -416,40 +510,89 @@ func (srv *Server) versionHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(respBuf)
 }
 
+// Ifname returns the primary WireGuard interface name (tunnel 0). This is used
+// for backwards-compatible code paths like takeover and idle peer removal.
 func (srv *Server) Ifname() string {
-	return fmt.Sprintf("vprox%d", srv.Index)
+	return srv.TunnelIfname(0)
 }
 
-func (srv *Server) StartWireguard() error {
-	ifname := srv.Ifname()
-	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
+// TunnelIfname returns the WireGuard interface name for the t-th tunnel.
+// When NumTunnels == 1, this returns "vprox0" (same as before).
+// When NumTunnels > 1, tunnel 0 is "vprox0", tunnel 1 is "vprox0t1", etc.
+func (srv *Server) TunnelIfname(t int) string {
+	base := fmt.Sprintf("vprox%d", srv.Index)
+	if t == 0 {
+		return base
+	}
+	return fmt.Sprintf("%st%d", base, t)
+}
 
-	// Track whether we created a fresh interface (for cleanup on error)
+// tunnelListenPort returns the UDP listen port for the t-th tunnel.
+func (srv *Server) tunnelListenPort(t int) int {
+	return WireguardListenPortBase + int(srv.Index)*PortsPerIndex + t
+}
+
+// StartWireguard creates and configures all tunnel WireGuard interfaces.
+func (srv *Server) StartWireguard() error {
+	nt := srv.numTunnels()
+	for t := 0; t < nt; t++ {
+		if err := srv.startWireguardTunnel(t); err != nil {
+			// Clean up any tunnels we already created.
+			for rb := 0; rb < t; rb++ {
+				srv.cleanupWireguardTunnel(rb)
+			}
+			return err
+		}
+	}
+	if nt > 1 {
+		log.Printf("[%v] started %d WireGuard tunnels (ports %d..%d)",
+			srv.BindAddr, nt, srv.tunnelListenPort(0), srv.tunnelListenPort(nt-1))
+
+		// Set up policy routing so reply traffic is distributed across tunnels.
+		if err := srv.setupPolicyRouting(nt); err != nil {
+			log.Printf("[%v] warning: failed to set up policy routing: %v", srv.BindAddr, err)
+		} else {
+			log.Printf("[%v] policy routing configured across %d tunnels", srv.BindAddr, nt)
+		}
+	}
+	return nil
+}
+
+// startWireguardTunnel creates and configures a single WireGuard tunnel interface.
+func (srv *Server) startWireguardTunnel(t int) error {
+	ifname := srv.TunnelIfname(t)
+	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{
+		Name:        ifname,
+		MTU:         WireguardMTU,
+		TxQLen:      WireguardTxQLen,
+		NumTxQueues: WireguardNumQueues,
+		NumRxQueues: WireguardNumQueues,
+		GSOMaxSize:  WireguardGSOMaxSize,
+		GROMaxSize:  WireguardGSOMaxSize,
+	}}
+
 	createdFreshInterface := false
 
 	if srv.takeover {
-		// In takeover mode, use existing interface if available, otherwise create fresh
 		_, err := netlink.LinkByName(ifname)
 		if err == nil {
 			log.Printf("[%v] takeover mode: using existing WireGuard interface %s", srv.BindAddr, ifname)
 		} else {
-			// Interface doesn't exist, create fresh
 			log.Printf("[%v] takeover mode: interface %s not found, creating fresh", srv.BindAddr, ifname)
-			if err := srv.createFreshInterface(link); err != nil {
+			if err := srv.createFreshInterface(link, t); err != nil {
 				return err
 			}
 			createdFreshInterface = true
 		}
 	} else {
-		// Normal mode: delete and recreate the interface
 		_ = netlink.LinkDel(link) // remove if it already exists
-		if err := srv.createFreshInterface(link); err != nil {
+		if err := srv.createFreshInterface(link, t); err != nil {
 			return err
 		}
 		createdFreshInterface = true
 	}
 
-	listenPort := WireguardListenPortBase + int(srv.Index)
+	listenPort := srv.tunnelListenPort(t)
 	err := srv.WgClient.ConfigureDevice(ifname, wgtypes.Config{
 		PrivateKey: &srv.Key,
 		ListenPort: &listenPort,
@@ -465,28 +608,129 @@ func (srv *Server) StartWireguard() error {
 }
 
 // createFreshInterface creates and configures a new WireGuard interface.
-func (srv *Server) createFreshInterface(link *linkWireguard) error {
+// Every tunnel interface gets the same subnet IP so the kernel can route
+// reply packets back through any of them.
+func (srv *Server) createFreshInterface(link *linkWireguard, tunnelIndex int) error {
 	err := netlink.LinkAdd(link)
 	if err != nil {
-		return fmt.Errorf("failed to create WireGuard device: %v", err)
+		return fmt.Errorf("failed to create WireGuard device %s: %v", link.Name, err)
 	}
 
+	// Assign the subnet IP to every tunnel interface.
 	ipnet := prefixToIPNet(srv.WgCidr)
-	err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipnet})
+	err = netlink.AddrReplace(link, &netlink.Addr{IPNet: &ipnet})
 	if err != nil {
 		netlink.LinkDel(link)
-		return fmt.Errorf("failed to add address to WireGuard device: %v", err)
+		return fmt.Errorf("failed to add address to WireGuard device %s: %v", link.Name, err)
+	}
+
+	// Set MTU explicitly after link creation (some kernels ignore it in LinkAttrs)
+	err = netlink.LinkSetMTU(link, WireguardMTU)
+	if err != nil {
+		netlink.LinkDel(link)
+		return fmt.Errorf("failed to set MTU on WireGuard device %s: %v", link.Name, err)
+	}
+
+	// Set TxQLen for improved burst handling
+	err = netlink.LinkSetTxQLen(link, WireguardTxQLen)
+	if err != nil {
+		log.Printf("warning: failed to set TxQLen on WireGuard device %s: %v", link.Name, err)
 	}
 
 	err = netlink.LinkSetUp(link)
 	if err != nil {
 		netlink.LinkDel(link)
-		return fmt.Errorf("failed to bring up WireGuard device: %v", err)
+		return fmt.Errorf("failed to bring up WireGuard device %s: %v", link.Name, err)
 	}
 
 	return nil
 }
 
+// setupPolicyRouting creates:
+//  1. Multipath routes in a custom routing table across all WireGuard tunnels.
+//  2. An ip rule that matches traffic destined for the WireGuard subnet and
+//     directs it to that custom table.
+//
+// The rule matches on destination (not source) because the server forwards
+// traffic from the internet to clients — the source IP of forwarded packets is
+// the remote host, not the server's WireGuard IP.
+func (srv *Server) setupPolicyRouting(nt int) error {
+	// Build multipath nexthops — one per tunnel interface. We use the subnet
+	// as the destination (not default) since the server only needs to reach
+	// the WireGuard peer subnet via these tunnels.
+	subnetIPNet := prefixToIPNet(srv.WgCidr.Masked())
+
+	var nexthops []*netlink.NexthopInfo
+	for t := 0; t < nt; t++ {
+		ifname := srv.TunnelIfname(t)
+		link, err := netlink.LinkByName(ifname)
+		if err != nil {
+			return fmt.Errorf("failed to find interface %s: %v", ifname, err)
+		}
+		nexthops = append(nexthops, &netlink.NexthopInfo{
+			LinkIndex: link.Attrs().Index,
+			Hops:      0,
+		})
+	}
+
+	// Add the multipath route in custom table.
+	mpRoute := &netlink.Route{
+		Table:     PolicyRoutingTable,
+		Dst:       &subnetIPNet,
+		MultiPath: nexthops,
+		Scope:     netlink.SCOPE_LINK,
+	}
+	if err := netlink.RouteReplace(mpRoute); err != nil {
+		return fmt.Errorf("failed to add multipath route to table %d: %v", PolicyRoutingTable, err)
+	}
+
+	// Add an ip rule: to <wg subnet> lookup custom table.
+	// This catches both locally-originated replies and forwarded (NAT'd) traffic
+	// destined for any client in the WireGuard subnet.
+	dstNet := &net.IPNet{
+		IP:   addrToIp(srv.WgCidr.Masked().Addr()),
+		Mask: net.CIDRMask(srv.WgCidr.Bits(), 32),
+	}
+	rule := netlink.NewRule()
+	rule.Dst = dstNet
+	rule.Table = PolicyRoutingTable
+	rule.Priority = PolicyRoutingPriority
+
+	// Remove any stale rule first (idempotent).
+	_ = netlink.RuleDel(rule)
+
+	if err := netlink.RuleAdd(rule); err != nil {
+		return fmt.Errorf("failed to add ip rule for dst %v: %v", dstNet, err)
+	}
+
+	return nil
+}
+
+// cleanupPolicyRouting removes the ip rule and flushes the custom routing table.
+func (srv *Server) cleanupPolicyRouting() {
+	dstNet := &net.IPNet{
+		IP:   addrToIp(srv.WgCidr.Masked().Addr()),
+		Mask: net.CIDRMask(srv.WgCidr.Bits(), 32),
+	}
+	rule := netlink.NewRule()
+	rule.Dst = dstNet
+	rule.Table = PolicyRoutingTable
+	rule.Priority = PolicyRoutingPriority
+	if err := netlink.RuleDel(rule); err != nil {
+		log.Printf("warning: failed to delete ip rule: %v", err)
+	}
+
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{
+		Table: PolicyRoutingTable,
+	}, netlink.RT_FILTER_TABLE)
+	if err == nil {
+		for i := range routes {
+			_ = netlink.RouteDel(&routes[i])
+		}
+	}
+}
+
+// CleanupWireguard removes all tunnel WireGuard interfaces and policy routing.
 func (srv *Server) CleanupWireguard() {
 	srv.mu.Lock()
 	relinquished := srv.relinquished
@@ -494,35 +738,58 @@ func (srv *Server) CleanupWireguard() {
 
 	if relinquished {
 		log.Printf("[%v] skipping WireGuard cleanup (relinquished)", srv.BindAddr)
-	} else {
-		log.Printf("[%v] cleaning up WireGuard state", srv.BindAddr)
-		ifname := srv.Ifname()
-		_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
+		return
+	}
+
+	log.Printf("[%v] cleaning up WireGuard state", srv.BindAddr)
+
+	if srv.numTunnels() > 1 {
+		srv.cleanupPolicyRouting()
+	}
+
+	nt := srv.numTunnels()
+	for t := 0; t < nt; t++ {
+		srv.cleanupWireguardTunnel(t)
 	}
 }
 
-// iptablesInputFwmarkRule adds or removes the mangle PREROUTING rule for traffic from WireGuard.
+// cleanupWireguardTunnel removes a single WireGuard tunnel interface.
+func (srv *Server) cleanupWireguardTunnel(t int) {
+	ifname := srv.TunnelIfname(t)
+	_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
+}
+
+// iptablesInputFwmarkRule adds or removes the mangle PREROUTING rule for traffic
+// from WireGuard. One rule per tunnel interface, all using the same fwmark.
 func (srv *Server) iptablesInputFwmarkRule(enabled bool) error {
 	firewallMark := FwmarkBase + int(srv.Index)
-	rule := []string{
-		"-i", srv.Ifname(),
-		"-j", "MARK", "--set-mark", strconv.Itoa(firewallMark),
-		"-m", "comment", "--comment", fmt.Sprintf("vprox fwmark rule for %s", srv.Ifname()),
+	nt := srv.numTunnels()
+	for t := 0; t < nt; t++ {
+		ifname := srv.TunnelIfname(t)
+		rule := []string{
+			"-i", ifname,
+			"-j", "MARK", "--set-mark", strconv.Itoa(firewallMark),
+			"-m", "comment", "--comment", fmt.Sprintf("vprox fwmark rule for %s", ifname),
+		}
+		if enabled {
+			if err := srv.Ipt.AppendUnique("mangle", "PREROUTING", rule...); err != nil {
+				return err
+			}
+		} else {
+			srv.Ipt.Delete("mangle", "PREROUTING", rule...)
+		}
 	}
-	if enabled {
-		return srv.Ipt.AppendUnique("mangle", "PREROUTING", rule...)
-	} else {
-		return srv.Ipt.Delete("mangle", "PREROUTING", rule...)
-	}
+	return nil
 }
 
 // iptablesSnatRule adds or removes the nat POSTROUTING rule for outbound traffic.
+// This is shared across all tunnels via fwmark (only one rule needed).
 func (srv *Server) iptablesSnatRule(enabled bool) error {
 	firewallMark := FwmarkBase + int(srv.Index)
 	rule := []string{
 		"-m", "mark", "--mark", strconv.Itoa(firewallMark),
 		"-j", "SNAT", "--to-source", srv.BindAddr.String(),
-		"-m", "comment", "--comment", fmt.Sprintf("vprox snat rule for %s", srv.Ifname()),
+		"-m", "comment", "--comment", fmt.Sprintf("vprox snat rule for index %d", srv.Index),
 	}
 	if enabled {
 		return srv.Ipt.AppendUnique("nat", "POSTROUTING", rule...)
@@ -531,21 +798,78 @@ func (srv *Server) iptablesSnatRule(enabled bool) error {
 	}
 }
 
-// iptablesMssRule adds or removes the FORWARD chain rule for TCP MSS adjustment
-func (srv *Server) iptablesMssRule(enabled bool) error {
-	rule := []string{
-		"-p", "tcp",
-		"--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS",
-		"--set-mss", "1160",
-		"-m", "comment", "--comment", fmt.Sprintf("vprox mss rule for %s", srv.Ifname()),
+// iptablesNotrackRule adds or removes NOTRACK rules in the raw table to bypass
+// connection tracking for WireGuard UDP traffic on all tunnel ports.
+func (srv *Server) iptablesNotrackRule(enabled bool) error {
+	nt := srv.numTunnels()
+	for t := 0; t < nt; t++ {
+		listenPort := strconv.Itoa(srv.tunnelListenPort(t))
+		ifname := srv.TunnelIfname(t)
+		inRule := []string{
+			"-p", "udp",
+			"--dport", listenPort,
+			"-j", "NOTRACK",
+			"-m", "comment", "--comment", fmt.Sprintf("vprox notrack in for %s", ifname),
+		}
+		outRule := []string{
+			"-p", "udp",
+			"--sport", listenPort,
+			"-j", "NOTRACK",
+			"-m", "comment", "--comment", fmt.Sprintf("vprox notrack out for %s", ifname),
+		}
+		if enabled {
+			if err := srv.Ipt.AppendUnique("raw", "PREROUTING", inRule...); err != nil {
+				return fmt.Errorf("failed to add NOTRACK PREROUTING rule for %s: %v", ifname, err)
+			}
+			if err := srv.Ipt.AppendUnique("raw", "OUTPUT", outRule...); err != nil {
+				srv.Ipt.Delete("raw", "PREROUTING", inRule...)
+				return fmt.Errorf("failed to add NOTRACK OUTPUT rule for %s: %v", ifname, err)
+			}
+		} else {
+			srv.Ipt.Delete("raw", "PREROUTING", inRule...)
+			srv.Ipt.Delete("raw", "OUTPUT", outRule...)
+		}
 	}
+	return nil
+}
 
-	if enabled {
-		return srv.Ipt.AppendUnique("filter", "FORWARD", rule...)
-	} else {
-		return srv.Ipt.Delete("filter", "FORWARD", rule...)
+// iptablesMssRule adds or removes FORWARD chain rules for TCP MSS clamping in
+// both directions on all tunnel interfaces.
+func (srv *Server) iptablesMssRule(enabled bool) error {
+	nt := srv.numTunnels()
+	for t := 0; t < nt; t++ {
+		ifname := srv.TunnelIfname(t)
+		outRule := []string{
+			"-o", ifname,
+			"-p", "tcp",
+			"--tcp-flags", "SYN,RST", "SYN",
+			"-j", "TCPMSS",
+			"--set-mss", strconv.Itoa(WireguardMSS),
+			"-m", "comment", "--comment", fmt.Sprintf("vprox mss out rule for %s", ifname),
+		}
+		inRule := []string{
+			"-i", ifname,
+			"-p", "tcp",
+			"--tcp-flags", "SYN,RST", "SYN",
+			"-j", "TCPMSS",
+			"--set-mss", strconv.Itoa(WireguardMSS),
+			"-m", "comment", "--comment", fmt.Sprintf("vprox mss in rule for %s", ifname),
+		}
+
+		if enabled {
+			if err := srv.Ipt.AppendUnique("mangle", "FORWARD", outRule...); err != nil {
+				return err
+			}
+			if err := srv.Ipt.AppendUnique("mangle", "FORWARD", inRule...); err != nil {
+				srv.Ipt.Delete("mangle", "FORWARD", outRule...)
+				return err
+			}
+		} else {
+			srv.Ipt.Delete("mangle", "FORWARD", outRule...)
+			srv.Ipt.Delete("mangle", "FORWARD", inRule...)
+		}
 	}
+	return nil
 }
 
 func (srv *Server) StartIptables() error {
@@ -567,16 +891,25 @@ func (srv *Server) StartIptables() error {
 		return fmt.Errorf("failed to add MSS rule: %v", err)
 	}
 
+	// NOTRACK is best-effort — don't fail startup if the raw table isn't available.
+	if err = srv.iptablesNotrackRule(true); err != nil {
+		log.Printf("warning: failed to add NOTRACK rules (non-fatal): %v", err)
+	}
+
 	return nil
 }
 
 func (srv *Server) CleanupIptables() {
 	if err := srv.iptablesInputFwmarkRule(false); err != nil {
-		log.Printf("warning: error cleaning up IP tables: failed to add fwmark rule: %v\n", err)
+		log.Printf("warning: error cleaning up iptables fwmark rule: %v\n", err)
 	}
 	if err := srv.iptablesSnatRule(false); err != nil {
-		log.Printf("warning: error cleaning up IP tables: failed to add SNAT rule: %v\n", err)
+		log.Printf("warning: error cleaning up iptables SNAT rule: %v\n", err)
 	}
+	if err := srv.iptablesMssRule(false); err != nil {
+		log.Printf("warning: error cleaning up iptables MSS rule: %v\n", err)
+	}
+	srv.iptablesNotrackRule(false)
 }
 
 func (srv *Server) removeIdlePeersLoop() {
@@ -594,15 +927,13 @@ func (srv *Server) removeIdlePeersLoop() {
 	}
 }
 
-// cleanupPeer removes a peer from the WireGuard interface, reclaims its subnet IP,
-// and removes it from the allPeers map. This function is idempotent and safe to call
-// even if the peer doesn't exist. It uses the allPeers map as the source of truth.
+// cleanupPeer removes a peer from ALL WireGuard tunnel interfaces, reclaims its
+// subnet IP, and removes it from the allPeers map.
 func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
 	// Look up the peer in allPeers map to get its IP address.
 	srv.mu.Lock()
 	peerInfo, exists := srv.allPeers[publicKey]
 	if !exists {
-		// Peer not in allPeers - it likely already got cleaned up.
 		srv.mu.Unlock()
 		log.Printf("[%v] peer unexpectedly not found in allPeers - did /disconnect race with the periodic peer-GC loop?: %v", srv.BindAddr, publicKey)
 		return nil
@@ -613,18 +944,23 @@ func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
 	delete(srv.allPeers, publicKey)
 	srv.mu.Unlock()
 
-	// Remove the peer from WireGuard (no lock held during WireGuard operations).
-	log.Printf("[%v] removing peer at %v: %v", srv.BindAddr, peerIp, publicKey)
-	err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
-		Peers: []wgtypes.PeerConfig{
-			{
-				PublicKey: publicKey,
-				Remove:    true,
+	// Remove the peer from ALL tunnel interfaces.
+	nt := srv.numTunnels()
+	log.Printf("[%v] removing peer at %v from %d tunnel(s): %v", srv.BindAddr, peerIp, nt, publicKey)
+	var firstErr error
+	for t := 0; t < nt; t++ {
+		ifname := srv.TunnelIfname(t)
+		err := srv.WgClient.ConfigureDevice(ifname, wgtypes.Config{
+			Peers: []wgtypes.PeerConfig{
+				{
+					PublicKey: publicKey,
+					Remove:    true,
+				},
 			},
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("failed to remove WireGuard peer: %v", err)
+		})
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("failed to remove WireGuard peer from %s: %v", ifname, err)
+		}
 	}
 
 	// Free the IP address.
@@ -632,10 +968,12 @@ func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
 		srv.ipAllocator.Free(peerIp)
 	}
 
-	return nil
+	return firstErr
 }
 
 func (srv *Server) removeIdlePeers() error {
+	// Check idle status using the primary tunnel interface (tunnel 0).
+	// All tunnels share the same peers, so we only need to inspect one.
 	device, err := srv.WgClient.Device(srv.Ifname())
 	if err != nil {
 		return fmt.Errorf("failed to get WireGuard device: %v", err)
@@ -645,7 +983,7 @@ func (srv *Server) removeIdlePeers() error {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
-	var removePeers []wgtypes.PeerConfig
+	var removePeerKeys []wgtypes.Key
 	var removeIps []netip.Addr
 	for _, peer := range device.Peers {
 		var idle bool
@@ -654,8 +992,6 @@ func (srv *Server) removeIdlePeers() error {
 			if exists {
 				idle = time.Since(peerInfo.ConnectionTime) > PeerIdleTimeout
 			} else {
-				// If we somehow have a WireGuard interface for a peer but no allPeers entry,
-				// let's just assume it's idle and remove it.
 				idle = true
 			}
 		} else {
@@ -671,19 +1007,28 @@ func (srv *Server) removeIdlePeers() error {
 					removeIps = append(removeIps, netip.AddrFrom4([4]byte(ipv4)))
 				}
 			}
-			removePeers = append(removePeers, wgtypes.PeerConfig{
-				PublicKey: peer.PublicKey,
-				Remove:    true,
-			})
+			removePeerKeys = append(removePeerKeys, peer.PublicKey)
 			delete(srv.allPeers, peer.PublicKey)
 		}
 	}
 
-	if len(removePeers) > 0 {
-		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removePeers})
-		if err != nil {
-			return err
+	if len(removePeerKeys) > 0 {
+		// Build the peer removal config.
+		removePeers := make([]wgtypes.PeerConfig, len(removePeerKeys))
+		for i, pk := range removePeerKeys {
+			removePeers[i] = wgtypes.PeerConfig{PublicKey: pk, Remove: true}
 		}
+
+		// Remove from ALL tunnel interfaces.
+		nt := srv.numTunnels()
+		for t := 0; t < nt; t++ {
+			ifname := srv.TunnelIfname(t)
+			err := srv.WgClient.ConfigureDevice(ifname, wgtypes.Config{Peers: removePeers})
+			if err != nil {
+				log.Printf("warning: failed to remove idle peers from %s: %v", ifname, err)
+			}
+		}
+
 		for _, ip := range removeIps {
 			srv.ipAllocator.Free(ip)
 		}
