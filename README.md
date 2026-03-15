@@ -100,15 +100,15 @@ curl --interface vprox0 ifconfig.me  # => 1.2.3.4
 
 #### OIDC Authentication (Modal)
 
-vprox supports OIDC token-based authentication, designed for use with [Modal's OIDC integration](https://modal.com/docs/guide/oidc-integration). In this mode, the server verifies JWT identity tokens signed by Modal (or any OIDC-compliant issuer) instead of using a shared password.
+vprox supports OIDC token-based authentication, designed for use with [Modal's OIDC integration](https://modal.com/docs/guide/oidc-integration). In this mode, the server verifies JWT identity tokens signed by Modal instead of using a shared password.
 
-Modal automatically injects a short-lived OIDC identity token into every container via the `MODAL_IDENTITY_TOKEN` environment variable. The vprox server fetches the issuer's JWKS (JSON Web Key Set) to cryptographically verify token signatures and validate claims like workspace ID, environment, and expiration.
+Modal automatically injects a short-lived OIDC identity token into every container via `MODAL_IDENTITY_TOKEN`. To use it with vprox, set `VPROX_OIDC_TOKEN` to the value of that token. The vprox server fetches the issuer's JWKS (JSON Web Key Set) to cryptographically verify token signatures and validate claims like workspace ID, environment, and expiration.
 
 **Server setup:**
 
 ```bash
-# Start the server in OIDC mode, restricting access to a specific Modal workspace
-VPROX_AUTH_MODE=oidc \
+# Start the server in oidc-modal mode, restricting access to a specific Modal workspace
+VPROX_AUTH_MODE=oidc-modal \
 VPROX_OIDC_ISSUER=https://oidc.modal.com \
 VPROX_OIDC_ALLOWED_WORKSPACE_IDS=ws-abc123 \
   vprox server --ip 172.31.64.125 --wg-block 240.1.0.0/16
@@ -117,20 +117,22 @@ VPROX_OIDC_ALLOWED_WORKSPACE_IDS=ws-abc123 \
 **Client setup (inside a Modal container):**
 
 ```bash
-# The MODAL_IDENTITY_TOKEN env var is set automatically by Modal
-VPROX_AUTH_MODE=oidc vprox connect 1.2.3.4 --interface vprox0
+# Modal sets MODAL_IDENTITY_TOKEN automatically; pass it to vprox via VPROX_OIDC_TOKEN
+VPROX_AUTH_MODE=oidc-modal \
+VPROX_OIDC_TOKEN="$MODAL_IDENTITY_TOKEN" \
+  vprox connect 1.2.3.4 --interface vprox0
 ```
 
 **OIDC environment variables:**
 
 | Variable | Description | Default |
 |---|---|---|
-| `VPROX_AUTH_MODE` | Auth mode: `password` or `oidc` | `password` |
+| `VPROX_AUTH_MODE` | Auth mode: `password` or `oidc-modal` | `password` |
+| `VPROX_OIDC_TOKEN` | OIDC identity token (JWT) for client authentication | — |
 | `VPROX_OIDC_ISSUER` | OIDC issuer URL | `https://oidc.modal.com` |
 | `VPROX_OIDC_AUDIENCE` | Expected `aud` claim (skip check if empty) | _(empty)_ |
-| `VPROX_OIDC_ALLOWED_WORKSPACE_IDS` | Comma-separated list of allowed Modal workspace IDs | _(any)_ |
+| `VPROX_OIDC_ALLOWED_WORKSPACE_IDS` | Comma-separated list of allowed Modal workspace IDs. Set to `*` to explicitly allow all workspaces (**testing only**). | _(any)_ |
 | `VPROX_OIDC_ALLOWED_ENVIRONMENTS` | Comma-separated list of allowed Modal environment names | _(any)_ |
-| `MODAL_IDENTITY_TOKEN` | OIDC token (set automatically by Modal in containers) | — |
 
 Note that Machine B must be able to send UDP packets to port 50227 on Machine A, and TCP to port 443.
 
@@ -164,7 +166,7 @@ On AWS in particular, the `--cloud aws` option allows you to automatically disco
 - Control traffic is encrypted with TLS (Warning: does not verify server certificate)
 - Optimized for throughput with automatic MTU, MSS, GSO/GRO, and multi-queue configuration
 - Connection tracking bypass (NOTRACK) for reduced CPU overhead on WireGuard UDP flows
-- OIDC authentication for passwordless auth from Modal containers (or any OIDC provider)
+- OIDC authentication for passwordless auth from Modal containers (`oidc-modal`)
 
 ## Authors
 

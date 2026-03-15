@@ -35,7 +35,7 @@ func b64url(data []byte) string {
 }
 
 // signJWT creates a signed RS256 JWT from the given header, claims, and private key.
-func signJWT(t *testing.T, header jwtHeader, claims ModalOIDCClaims, key *rsa.PrivateKey) string {
+func signJWT(t *testing.T, header jwtHeader, claims ModalClaims, key *rsa.PrivateKey) string {
 	t.Helper()
 
 	hdrJSON, err := json.Marshal(header)
@@ -119,7 +119,7 @@ func buildOIDCAuthenticator(t *testing.T, configFn func(cfg *OIDCConfig)) (*Auth
 		configFn(cfg)
 	}
 
-	auth, err := NewOIDCAuthenticator(cfg)
+	auth, err := NewOIDCModalAuthenticator(cfg)
 	require.NoError(t, err)
 	return auth, issuer, priv
 }
@@ -128,9 +128,9 @@ func defaultHeader() jwtHeader {
 	return jwtHeader{Alg: "RS256", Kid: "test-key-1", Typ: "JWT"}
 }
 
-func defaultClaims(issuer string) ModalOIDCClaims {
+func defaultClaims(issuer string) ModalClaims {
 	now := time.Now().Unix()
-	return ModalOIDCClaims{
+	return ModalClaims{
 		Sub:             "ws-abc123:main:my-app:my-func",
 		Aud:             "",
 		Exp:             now + 3600,
@@ -426,7 +426,7 @@ func TestOIDCAuth_MissingHeader(t *testing.T) {
 
 func TestOIDCAuth_Mode(t *testing.T) {
 	auth, _, _ := buildOIDCAuthenticator(t, nil)
-	assert.Equal(t, AuthModeOIDC, auth.Mode())
+	assert.Equal(t, AuthModeOIDCModal, auth.Mode())
 }
 
 func TestOIDCAuth_NoAudienceCheck_WhenNotConfigured(t *testing.T) {
@@ -661,26 +661,26 @@ func TestDiscoverJWKSURL_ServerDown(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// --- NewOIDCAuthenticator error cases ---
+// --- NewOIDCModalAuthenticator error cases ---
 
-func TestNewOIDCAuthenticator_EmptyIssuer(t *testing.T) {
-	_, err := NewOIDCAuthenticator(&OIDCConfig{IssuerURL: ""})
+func TestNewOIDCModalAuthenticator_EmptyIssuer(t *testing.T) {
+	_, err := NewOIDCModalAuthenticator(&OIDCConfig{IssuerURL: ""})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "issuer URL is required")
 }
 
-func TestNewOIDCAuthenticator_BadIssuer(t *testing.T) {
-	_, err := NewOIDCAuthenticator(&OIDCConfig{IssuerURL: "http://127.0.0.1:1"})
+func TestNewOIDCModalAuthenticator_BadIssuer(t *testing.T) {
+	_, err := NewOIDCModalAuthenticator(&OIDCConfig{IssuerURL: "http://127.0.0.1:1"})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to discover JWKS")
 }
 
-func TestNewOIDCAuthenticator_TrailingSlashNormalized(t *testing.T) {
+func TestNewOIDCModalAuthenticator_TrailingSlashNormalized(t *testing.T) {
 	priv := testKeyPair(t)
 	_, issuer := serveJWKS(t, map[string]*rsa.PublicKey{"k": &priv.PublicKey})
 
 	// Pass issuer with trailing slash — it should be trimmed.
-	auth, err := NewOIDCAuthenticator(&OIDCConfig{IssuerURL: issuer + "/"})
+	auth, err := NewOIDCModalAuthenticator(&OIDCConfig{IssuerURL: issuer + "/"})
 	require.NoError(t, err)
 
 	claims := defaultClaims(issuer) // claims use the issuer without trailing slash
@@ -732,14 +732,14 @@ func TestOIDCAuth_FullClaimValidation_FailEach(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		mutate  func(c *ModalOIDCClaims)
+		mutate  func(c *ModalClaims)
 		errPart string
 	}{
-		{"wrong audience", func(c *ModalOIDCClaims) { c.Aud = "other" }, "audience mismatch"},
-		{"wrong workspace", func(c *ModalOIDCClaims) { c.WorkspaceID = "ws-other" }, "workspace"},
-		{"wrong environment", func(c *ModalOIDCClaims) { c.EnvironmentName = "dev" }, "environment"},
-		{"expired", func(c *ModalOIDCClaims) { c.Exp = time.Now().Unix() - 10 }, "expired"},
-		{"wrong issuer", func(c *ModalOIDCClaims) { c.Iss = "https://evil.example.com" }, "issuer mismatch"},
+		{"wrong audience", func(c *ModalClaims) { c.Aud = "other" }, "audience mismatch"},
+		{"wrong workspace", func(c *ModalClaims) { c.WorkspaceID = "ws-other" }, "workspace"},
+		{"wrong environment", func(c *ModalClaims) { c.EnvironmentName = "dev" }, "environment"},
+		{"expired", func(c *ModalClaims) { c.Exp = time.Now().Unix() - 10 }, "expired"},
+		{"wrong issuer", func(c *ModalClaims) { c.Iss = "https://evil.example.com" }, "issuer mismatch"},
 	}
 
 	for _, tc := range tests {
@@ -832,7 +832,7 @@ func TestVerifyRS256Signature(t *testing.T) {
 
 // --- Modal claims parsing ---
 
-func TestModalOIDCClaims_AllFieldsParsed(t *testing.T) {
+func TestModalClaims_AllFieldsParsed(t *testing.T) {
 	raw := `{
 		"sub": "ws-123:main:app:fn",
 		"aud": "my-aud",
@@ -850,7 +850,7 @@ func TestModalOIDCClaims_AllFieldsParsed(t *testing.T) {
 		"container_id": "ctr-345"
 	}`
 
-	var claims ModalOIDCClaims
+	var claims ModalClaims
 	err := json.Unmarshal([]byte(raw), &claims)
 	require.NoError(t, err)
 
