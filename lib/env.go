@@ -60,13 +60,6 @@ func GetOIDCAllowedWorkspaceIDs() []string {
 	return splitCSV(raw)
 }
 
-// GetOIDCAllowedEnvironmentNames returns the list of allowed Modal environment
-// names from the VPROX_OIDC_ALLOWED_ENVIRONMENTS environment variable (comma-separated).
-// If empty, any environment is allowed.
-func GetOIDCAllowedEnvironmentNames() []string {
-	return splitCSV(os.Getenv("VPROX_OIDC_ALLOWED_ENVIRONMENTS"))
-}
-
 // GetOIDCToken returns the OIDC identity token from the VPROX_OIDC_TOKEN
 // environment variable.
 func GetOIDCToken() (string, error) {
@@ -85,10 +78,9 @@ func GetAuthenticator() (*Authenticator, error) {
 	switch mode {
 	case AuthModeOIDCModal:
 		config := &OIDCConfig{
-			IssuerURL:               GetOIDCIssuerURL(),
-			Audience:                GetOIDCAudience(),
-			AllowedWorkspaceIDs:     GetOIDCAllowedWorkspaceIDs(),
-			AllowedEnvironmentNames: GetOIDCAllowedEnvironmentNames(),
+			IssuerURL:           GetOIDCIssuerURL(),
+			Audience:            GetOIDCAudience(),
+			AllowedWorkspaceIDs: GetOIDCAllowedWorkspaceIDs(),
 		}
 		auth, err := NewOIDCModalAuthenticator(config)
 		if err != nil {

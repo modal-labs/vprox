@@ -102,8 +102,6 @@ curl --interface vprox0 ifconfig.me  # => 1.2.3.4
 
 vprox supports OIDC token-based authentication, designed for use with [Modal's OIDC integration](https://modal.com/docs/guide/oidc-integration). In this mode, the server verifies JWT identity tokens signed by Modal instead of using a shared password.
 
-Modal automatically injects a short-lived OIDC identity token into every container via `MODAL_IDENTITY_TOKEN`. To use it with vprox, set `VPROX_OIDC_TOKEN` to the value of that token. The vprox server fetches the issuer's JWKS (JSON Web Key Set) to cryptographically verify token signatures and validate claims like workspace ID, environment, and expiration.
-
 **Server setup:**
 
 ```bash
@@ -132,7 +130,6 @@ VPROX_OIDC_TOKEN="$MODAL_IDENTITY_TOKEN" \
 | `VPROX_OIDC_ISSUER` | OIDC issuer URL | `https://oidc.modal.com` |
 | `VPROX_OIDC_AUDIENCE` | Expected `aud` claim (skip check if empty) | _(empty)_ |
 | `VPROX_OIDC_ALLOWED_WORKSPACE_IDS` | Comma-separated list of allowed Modal workspace IDs. Set to `*` to explicitly allow all workspaces (**testing only**). | _(any)_ |
-| `VPROX_OIDC_ALLOWED_ENVIRONMENTS` | Comma-separated list of allowed Modal environment names | _(any)_ |
 
 Note that Machine B must be able to send UDP packets to port 50227 on Machine A, and TCP to port 443.
 

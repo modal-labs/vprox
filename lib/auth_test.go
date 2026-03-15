@@ -322,30 +322,6 @@ func TestOIDCAuth_AllowedWorkspaceIDs(t *testing.T) {
 	assert.Contains(t, err.Error(), "not in the allowed list")
 }
 
-func TestOIDCAuth_AllowedEnvironmentNames(t *testing.T) {
-	auth, issuer, priv := buildOIDCAuthenticator(t, func(cfg *OIDCConfig) {
-		cfg.AllowedEnvironmentNames = []string{"main", "staging"}
-	})
-
-	// Allowed environment.
-	claims := defaultClaims(issuer)
-	claims.EnvironmentName = "main"
-	token := signJWT(t, defaultHeader(), claims, priv)
-	req := httptest.NewRequest("GET", "/connect", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	assert.NoError(t, auth.Authenticate(req))
-
-	// Disallowed environment.
-	claims.EnvironmentName = "production"
-	token = signJWT(t, defaultHeader(), claims, priv)
-	req = httptest.NewRequest("GET", "/connect", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	err := auth.Authenticate(req)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "environment")
-	assert.Contains(t, err.Error(), "not in the allowed list")
-}
-
 func TestOIDCAuth_WrongSignature(t *testing.T) {
 	auth, issuer, _ := buildOIDCAuthenticator(t, nil)
 
@@ -448,18 +424,6 @@ func TestOIDCAuth_NoWorkspaceCheck_WhenNotConfigured(t *testing.T) {
 
 	claims := defaultClaims(issuer)
 	claims.WorkspaceID = "ws-any-workspace"
-	token := signJWT(t, defaultHeader(), claims, priv)
-
-	req := httptest.NewRequest("GET", "/connect", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	assert.NoError(t, auth.Authenticate(req))
-}
-
-func TestOIDCAuth_NoEnvironmentCheck_WhenNotConfigured(t *testing.T) {
-	auth, issuer, priv := buildOIDCAuthenticator(t, nil)
-
-	claims := defaultClaims(issuer)
-	claims.EnvironmentName = "any-env"
 	token := signJWT(t, defaultHeader(), claims, priv)
 
 	req := httptest.NewRequest("GET", "/connect", nil)
@@ -705,13 +669,11 @@ func TestOIDCAuth_FullClaimValidation(t *testing.T) {
 	auth, issuer, priv := buildOIDCAuthenticator(t, func(cfg *OIDCConfig) {
 		cfg.Audience = "vprox-server"
 		cfg.AllowedWorkspaceIDs = []string{"ws-prod"}
-		cfg.AllowedEnvironmentNames = []string{"main"}
 	})
 
 	claims := defaultClaims(issuer)
 	claims.Aud = "vprox-server"
 	claims.WorkspaceID = "ws-prod"
-	claims.EnvironmentName = "main"
 
 	token := signJWT(t, defaultHeader(), claims, priv)
 	req := httptest.NewRequest("POST", "/connect", nil)
@@ -726,7 +688,6 @@ func TestOIDCAuth_FullClaimValidation_FailEach(t *testing.T) {
 		return buildOIDCAuthenticator(t, func(cfg *OIDCConfig) {
 			cfg.Audience = "vprox-server"
 			cfg.AllowedWorkspaceIDs = []string{"ws-prod"}
-			cfg.AllowedEnvironmentNames = []string{"main"}
 		})
 	}
 
@@ -737,7 +698,6 @@ func TestOIDCAuth_FullClaimValidation_FailEach(t *testing.T) {
 	}{
 		{"wrong audience", func(c *ModalClaims) { c.Aud = "other" }, "audience mismatch"},
 		{"wrong workspace", func(c *ModalClaims) { c.WorkspaceID = "ws-other" }, "workspace"},
-		{"wrong environment", func(c *ModalClaims) { c.EnvironmentName = "dev" }, "environment"},
 		{"expired", func(c *ModalClaims) { c.Exp = time.Now().Unix() - 10 }, "expired"},
 		{"wrong issuer", func(c *ModalClaims) { c.Iss = "https://evil.example.com" }, "issuer mismatch"},
 	}
@@ -749,7 +709,6 @@ func TestOIDCAuth_FullClaimValidation_FailEach(t *testing.T) {
 			claims := defaultClaims(issuer)
 			claims.Aud = "vprox-server"
 			claims.WorkspaceID = "ws-prod"
-			claims.EnvironmentName = "main"
 			tc.mutate(&claims)
 
 			token := signJWT(t, defaultHeader(), claims, priv)

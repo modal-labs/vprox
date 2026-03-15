@@ -81,18 +81,6 @@ func TestGetOIDCIssuerURL_Custom(t *testing.T) {
 	assert.Equal(t, "https://custom.issuer.example.com", GetOIDCIssuerURL())
 }
 
-func TestGetOIDCAllowedEnvironmentNames_CommaSeparated(t *testing.T) {
-	t.Setenv("VPROX_OIDC_ALLOWED_ENVIRONMENTS", "main, staging")
-	result := GetOIDCAllowedEnvironmentNames()
-	assert.Equal(t, []string{"main", "staging"}, result)
-}
-
-func TestGetOIDCAllowedEnvironmentNames_Empty(t *testing.T) {
-	t.Setenv("VPROX_OIDC_ALLOWED_ENVIRONMENTS", "")
-	result := GetOIDCAllowedEnvironmentNames()
-	assert.Nil(t, result)
-}
-
 func TestGetOIDCToken_Set(t *testing.T) {
 	t.Setenv("VPROX_OIDC_TOKEN", "eyJhbGciOiJSUzI1NiJ9.test.sig")
 	token, err := GetOIDCToken()

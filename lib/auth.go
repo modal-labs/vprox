@@ -35,10 +35,6 @@ type OIDCConfig struct {
 	// AllowedWorkspaceIDs is a list of Modal workspace IDs that are allowed to authenticate.
 	// If empty, any workspace is allowed (only issuer/signature are checked).
 	AllowedWorkspaceIDs []string
-
-	// AllowedEnvironmentNames is a list of Modal environment names that are allowed.
-	// If empty, any environment is allowed.
-	AllowedEnvironmentNames []string
 }
 
 // Authenticator provides request authentication for the vprox server.
@@ -171,16 +167,10 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 		return fmt.Errorf("audience mismatch: got %q, expected %q", claims.Aud, a.oidc.Audience)
 	}
 
-	// Verify Modal workspace/environment claims.
+	// Verify Modal workspace claim.
 	if len(a.oidc.AllowedWorkspaceIDs) > 0 {
 		if !stringInSlice(claims.WorkspaceID, a.oidc.AllowedWorkspaceIDs) {
 			return fmt.Errorf("workspace %q is not in the allowed list", claims.WorkspaceID)
-		}
-	}
-
-	if len(a.oidc.AllowedEnvironmentNames) > 0 {
-		if !stringInSlice(claims.EnvironmentName, a.oidc.AllowedEnvironmentNames) {
-			return fmt.Errorf("environment %q is not in the allowed list", claims.EnvironmentName)
 		}
 	}
 
