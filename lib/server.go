@@ -40,6 +40,13 @@ const FirstHandshakeTimeout = 10 * time.Second
 // setting.
 const PeerIdleTimeout = 5 * time.Minute
 
+// peerState tracks per-peer metadata kept in memory so the connect handler can
+// avoid expensive netlink round-trips for duplicate checks.
+type peerState struct {
+	IP        netip.Addr
+	CreatedAt time.Time
+}
+
 // Server handles state for one WireGuard network.
 //
 // The `vprox server` command should create one Server instance for each
@@ -77,8 +84,8 @@ type Server struct {
 
 	ipAllocator *IpAllocator
 
-	mu       sync.Mutex // Protects the fields below.
-	newPeers map[wgtypes.Key]time.Time
+	mu    sync.Mutex // Protects the fields below.
+	peers map[wgtypes.Key]peerState
 }
 
 // InitState initializes the private server state.
@@ -97,7 +104,7 @@ func (srv *Server) InitState() error {
 	if reservedIp != srv.WgCidr.Addr() {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
-	srv.newPeers = make(map[wgtypes.Key]time.Time)
+	srv.peers = make(map[wgtypes.Key]peerState)
 	return nil
 }
 
@@ -149,51 +156,64 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If the new connection already exists as a peer, just return that IP.
-	peerIp := netip.AddrFrom4([4]byte{})
+	// Fast path: check the in-memory map for an existing allocation.
+	srv.mu.Lock()
+	if existing, ok := srv.peers[peerKey]; ok {
+		srv.mu.Unlock()
 
-	device, err := srv.WgClient.Device(srv.Ifname())
-	if err != nil {
-		http.Error(w, "failed to get WireGuard device", http.StatusInternalServerError)
-	}
-	for _, peer := range device.Peers {
-		if peer.PublicKey == peerKey && len(peer.AllowedIPs) > 0 {
-			peerIp, _ = netip.AddrFromSlice([]byte(peer.AllowedIPs[0].IP.To4()))
-			break
+		resp := &connectResponse{
+			AssignedAddr:     fmt.Sprintf("%v/%d", existing.IP, srv.WgCidr.Bits()),
+			ServerPublicKey:  srv.Key.PublicKey().String(),
+			ServerListenPort: WireguardListenPortBase + int(srv.Index),
 		}
+		respBuf, err := json.Marshal(resp)
+		if err != nil {
+			http.Error(w, "failed to serialize response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(respBuf)
+		return
 	}
 
-	// Add a WireGuard peer for the new connection.
+	// New peer — allocate an IP while still holding the lock so no two
+	// goroutines can race on the same key.
+	peerIp := srv.ipAllocator.Allocate()
 	if peerIp.IsUnspecified() {
-		peerIp = srv.ipAllocator.Allocate()
-	}
-	if peerIp.IsUnspecified() {
+		srv.mu.Unlock()
 		log.Printf("no more ip addresses available in %v", srv.WgCidr)
 		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
 		return
 	}
-
-	srv.mu.Lock()
-	srv.newPeers[peerKey] = time.Now()
+	srv.peers[peerKey] = peerState{IP: peerIp, CreatedAt: time.Now()}
 	srv.mu.Unlock()
 
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
 	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
-	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
-		Peers: []wgtypes.PeerConfig{
-			{
-				PublicKey:         peerKey,
-				ReplaceAllowedIPs: true,
-				AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
+
+	// Push the peer configuration to WireGuard in the background so that
+	// concurrent connect requests don't serialize on the netlink socket.
+	// The client will retry its WireGuard handshake for up to
+	// FirstHandshakeTimeout (10 s), which is plenty of time for this to
+	// complete.
+	go func() {
+		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
+			Peers: []wgtypes.PeerConfig{
+				{
+					PublicKey:         peerKey,
+					ReplaceAllowedIPs: true,
+					AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
+				},
 			},
-		},
-	})
-	if err != nil {
-		srv.ipAllocator.Free(peerIp)
-		log.Printf("failed to configure WireGuard peer: %v", err)
-		http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
-		return
-	}
+		})
+		if err != nil {
+			srv.mu.Lock()
+			delete(srv.peers, peerKey)
+			srv.mu.Unlock()
+			srv.ipAllocator.Free(peerIp)
+			log.Printf("failed to configure WireGuard peer: %v", err)
+		}
+	}()
 
 	// Return the assigned IP address and the server's public key.
 	resp := &connectResponse{
@@ -355,14 +375,14 @@ func (srv *Server) removeIdlePeers() error {
 		return fmt.Errorf("failed to get WireGuard device: %v", err)
 	}
 
-	// Hold the lock for access to newPeers.
+	// Hold the lock for access to peers.
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
-	// Clean up old entries from newPeers map, which should have connected by now.
-	for key, creationTime := range srv.newPeers {
-		if time.Since(creationTime) > PeerIdleTimeout {
-			delete(srv.newPeers, key)
+	// Clean up old entries from peers map, which should have connected by now.
+	for key, ps := range srv.peers {
+		if time.Since(ps.CreatedAt) > PeerIdleTimeout {
+			delete(srv.peers, key)
 		}
 	}
 
@@ -371,7 +391,7 @@ func (srv *Server) removeIdlePeers() error {
 	for _, peer := range device.Peers {
 		var idle bool
 		if peer.LastHandshakeTime.IsZero() {
-			_, isNew := srv.newPeers[peer.PublicKey]
+			_, isNew := srv.peers[peer.PublicKey]
 			idle = !isNew
 		} else {
 			idle = time.Since(peer.LastHandshakeTime) > PeerIdleTimeout
@@ -397,6 +417,9 @@ func (srv *Server) removeIdlePeers() error {
 		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removePeers})
 		if err != nil {
 			return err
+		}
+		for _, p := range removePeers {
+			delete(srv.peers, p.PublicKey)
 		}
 		for _, ip := range removeIps {
 			srv.ipAllocator.Free(ip)
