@@ -86,6 +86,12 @@ type Server struct {
 
 	mu    sync.Mutex // Protects the fields below.
 	peers map[wgtypes.Key]peerState
+
+	// pendingPeers receives peer configs that need to be flushed to WireGuard.
+	// The flushPeersLoop drains this channel and batches them into single
+	// ConfigureDevice calls.
+	pendingPeers chan wgtypes.PeerConfig
+	flushDone    chan struct{} // closed when flushPeersLoop exits
 }
 
 // InitState initializes the private server state.
@@ -105,6 +111,8 @@ func (srv *Server) InitState() error {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
 	srv.peers = make(map[wgtypes.Key]peerState)
+	srv.pendingPeers = make(chan wgtypes.PeerConfig, 4096)
+	srv.flushDone = make(chan struct{})
 	return nil
 }
 
@@ -191,29 +199,14 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
 	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
 
-	// Push the peer configuration to WireGuard in the background so that
-	// concurrent connect requests don't serialize on the netlink socket.
-	// The client will retry its WireGuard handshake for up to
-	// FirstHandshakeTimeout (10 s), which is plenty of time for this to
-	// complete.
-	go func() {
-		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
-			Peers: []wgtypes.PeerConfig{
-				{
-					PublicKey:         peerKey,
-					ReplaceAllowedIPs: true,
-					AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
-				},
-			},
-		})
-		if err != nil {
-			srv.mu.Lock()
-			delete(srv.peers, peerKey)
-			srv.mu.Unlock()
-			srv.ipAllocator.Free(peerIp)
-			log.Printf("failed to configure WireGuard peer: %v", err)
-		}
-	}()
+	// Enqueue the peer for batched WireGuard registration. The flushPeersLoop
+	// coalesces multiple pending peers into a single ConfigureDevice netlink
+	// call, avoiding the serialization bottleneck that caused timeouts.
+	srv.pendingPeers <- wgtypes.PeerConfig{
+		PublicKey:         peerKey,
+		ReplaceAllowedIPs: true,
+		AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
+	}
 
 	// Return the assigned IP address and the server's public key.
 	resp := &connectResponse{
@@ -272,6 +265,12 @@ func (srv *Server) StartWireguard() error {
 }
 
 func (srv *Server) CleanupWireguard() {
+	// Close the channel to signal the flush loop to drain and exit, then
+	// wait for it to finish so all peers are registered before we delete
+	// the interface.
+	close(srv.pendingPeers)
+	<-srv.flushDone
+
 	ifname := srv.Ifname()
 	_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
 }
@@ -456,6 +455,7 @@ func (srv *Server) ListenForHttps() error {
 	}
 
 	go srv.removeIdlePeersLoop()
+	go srv.flushPeersLoop()
 
 	// Some bind addresses may not have been added to the network interface. If
 	// that is the case, we need to add it (transiently).
@@ -500,6 +500,64 @@ func (srv *Server) ListenForHttps() error {
 		return httpServer.Shutdown(srv.Ctx)
 	case err = <-errCh:
 		return err
+	}
+}
+
+// flushPeersLoop drains srv.pendingPeers and batches peer configs into single
+// ConfigureDevice netlink calls. After receiving the first peer, it waits up
+// to 1 ms for more to arrive, then flushes them all at once. This turns N
+// concurrent /connect requests into 1 netlink call with N peers.
+func (srv *Server) flushPeersLoop() {
+	defer close(srv.flushDone)
+
+	for {
+		// Block until the first peer arrives or the channel is closed.
+		first, ok := <-srv.pendingPeers
+		if !ok {
+			return // channel closed, we're shutting down
+		}
+
+		// Collect as many additional peers as are immediately available,
+		// up to a short deadline to allow a burst to accumulate.
+		batch := []wgtypes.PeerConfig{first}
+		deadline := time.After(1 * time.Millisecond)
+	drain:
+		for {
+			select {
+			case p, ok := <-srv.pendingPeers:
+				if !ok {
+					// Channel closed mid-batch; flush what we have and exit.
+					srv.flushPeerBatch(batch)
+					return
+				}
+				batch = append(batch, p)
+			case <-deadline:
+				break drain
+			}
+		}
+
+		srv.flushPeerBatch(batch)
+	}
+}
+
+// flushPeerBatch sends a batch of peer configs to WireGuard in a single
+// netlink call. On failure, it rolls back the in-memory state for each peer.
+func (srv *Server) flushPeerBatch(batch []wgtypes.PeerConfig) {
+	err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
+		Peers: batch,
+	})
+	if err != nil {
+		log.Printf("failed to configure %d WireGuard peer(s): %v", len(batch), err)
+		srv.mu.Lock()
+		for _, p := range batch {
+			if ps, ok := srv.peers[p.PublicKey]; ok {
+				srv.ipAllocator.Free(ps.IP)
+				delete(srv.peers, p.PublicKey)
+			}
+		}
+		srv.mu.Unlock()
+	} else if len(batch) > 1 {
+		log.Printf("[%v] flushed %d peers to WireGuard in one call", srv.BindAddr, len(batch))
 	}
 }
 

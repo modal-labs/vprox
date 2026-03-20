@@ -11,12 +11,19 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os/exec"
+	"strings"
 	"time"
 
 	probing "github.com/prometheus-community/pro-bing"
 	"github.com/vishvananda/netlink"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+)
+
+const (
+	verifyPollInterval = 100 * time.Millisecond
+	verifyStepTimeout  = 10 * time.Second
 )
 
 // Client manages a peering connection with with a local WireGuard interface.
@@ -217,4 +224,118 @@ func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Contex
 		log.Printf("warning: %v of %v packets in ping were dropped", stats.PacketsSent-stats.PacketsRecv, stats.PacketsSent)
 	}
 	return stats.PacketsRecv > 0
+}
+
+// VerifyInterface mirrors the Rust verify_interface() check: it polls for the
+// interface to be UP with an IPv4 address, then waits for a WireGuard
+// handshake, then pings the server's tunnel address. Each step retries for up
+// to verifyStepTimeout (10 s) with verifyPollInterval (100 ms) between attempts.
+func (c *Client) VerifyInterface(ctx context.Context) error {
+	// Step 1: interface UP with an IPv4 address
+	if err := waitFor(ctx, verifyStepTimeout, verifyPollInterval, func() error {
+		return c.verifyInterfaceUp()
+	}); err != nil {
+		return fmt.Errorf("wireguard interface %s failed to come up: %w", c.Ifname, err)
+	}
+
+	// Step 2: WireGuard handshake completed
+	if err := waitFor(ctx, verifyStepTimeout, verifyPollInterval, func() error {
+		return c.verifyHandshake()
+	}); err != nil {
+		return fmt.Errorf("wireguard interface %s failed to handshake: %w", c.Ifname, err)
+	}
+
+	// Step 3: ping the server's tunnel address (first usable IP in the subnet)
+	peerAddr := c.wgCidr.Masked().Addr().Next()
+	if err := waitFor(ctx, verifyStepTimeout, verifyPollInterval, func() error {
+		return c.verifyPing(peerAddr)
+	}); err != nil {
+		return fmt.Errorf("wireguard interface %s failed connectivity ping to %v: %w",
+			c.Ifname, peerAddr, err)
+	}
+
+	return nil
+}
+
+// verifyInterfaceUp checks that the WireGuard interface is in the UP state and
+// has an IPv4 address assigned.
+func (c *Client) verifyInterfaceUp() error {
+	link, err := netlink.LinkByName(c.Ifname)
+	if err != nil {
+		return fmt.Errorf("interface not found: %w", err)
+	}
+	if link.Attrs().OperState != netlink.OperUp && (link.Attrs().Flags&net.FlagUp) == 0 {
+		return fmt.Errorf("interface %s is not UP (state=%v)", c.Ifname, link.Attrs().OperState)
+	}
+
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return fmt.Errorf("failed to list addresses: %w", err)
+	}
+	if len(addrs) == 0 {
+		return fmt.Errorf("no IPv4 address on interface %s", c.Ifname)
+	}
+	return nil
+}
+
+// verifyHandshake checks that the WireGuard device has completed a handshake
+// with at least one peer (i.e. LastHandshakeTime is non-zero).
+func (c *Client) verifyHandshake() error {
+	dev, err := c.WgClient.Device(c.Ifname)
+	if err != nil {
+		return fmt.Errorf("failed to get wireguard device: %w", err)
+	}
+	for _, peer := range dev.Peers {
+		if !peer.LastHandshakeTime.IsZero() {
+			return nil
+		}
+	}
+	return fmt.Errorf("no completed handshake on interface %s", c.Ifname)
+}
+
+// verifyPing sends 3 ICMP pings to the given address through the WireGuard
+// interface and returns an error if none are received.
+// verifyPing shells out to `ping -I <interface>` to verify connectivity,
+// matching the Rust verify_ping implementation. Using -I binds the socket to
+// the correct WireGuard interface, which is necessary when multiple interfaces
+// all have AllowedIPs 0.0.0.0/0 and would otherwise fight over the routing
+// table.
+func (c *Client) verifyPing(addr netip.Addr) error {
+	cmd := exec.Command("ping",
+		"-c", "3",
+		"-W", "5",
+		"-i", "0.1",
+		"-q",
+		"-I", c.Ifname,
+		addr.String(),
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ping to %v via %s failed: %s", addr, c.Ifname, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// waitFor retries check until it succeeds, the timeout expires, or ctx is
+// cancelled. It mirrors the Rust wait_for helper.
+func waitFor(ctx context.Context, timeout, interval time.Duration, check func() error) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		lastErr = check()
+		if lastErr == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+	return fmt.Errorf("timed out after %v: %w", timeout, lastErr)
 }

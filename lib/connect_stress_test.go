@@ -60,6 +60,8 @@ func testServerWithWg(t *testing.T, cidr netip.Prefix, index uint16) (*Server, f
 	srv.ipAllocator = NewIpAllocator(cidr)
 	_ = srv.ipAllocator.Allocate() // reserve the network address
 	srv.peers = make(map[wgtypes.Key]peerState)
+	srv.pendingPeers = make(chan wgtypes.PeerConfig, 4096)
+	srv.flushDone = make(chan struct{})
 
 	// Create the WireGuard interface.
 	ifname := srv.Ifname()
@@ -84,7 +86,12 @@ func testServerWithWg(t *testing.T, cidr netip.Prefix, index uint16) (*Server, f
 	})
 	require.NoError(t, err)
 
+	// Start the flush loop so enqueued peers actually get registered.
+	go srv.flushPeersLoop()
+
 	cleanup := func() {
+		close(srv.pendingPeers)
+		<-srv.flushDone
 		_ = netlink.LinkDel(link)
 		_ = wgClient.Close()
 	}

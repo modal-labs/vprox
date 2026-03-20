@@ -22,6 +22,7 @@ type ConnectionResult struct {
 	Index             int
 	Ifname            string
 	ConnectDuration   time.Duration
+	VerifyDuration    time.Duration
 	HealthCheckPassed bool
 	Error             error
 	Client            *lib.Client
@@ -35,9 +36,11 @@ var BenchCmd = &cobra.Command{
 }
 
 var benchCmdArgs struct {
-	ifprefix       string
-	numConnections int
+	ifprefix        string
+	numConnections  int
 	skipHealthCheck bool
+	verify          bool
+	timeout         time.Duration
 }
 
 func init() {
@@ -47,6 +50,10 @@ func init() {
 		1, "Number of parallel connections to establish")
 	BenchCmd.Flags().BoolVar(&benchCmdArgs.skipHealthCheck, "skip-healthcheck",
 		false, "Skip the post-connect health check ping")
+	BenchCmd.Flags().BoolVar(&benchCmdArgs.verify, "verify",
+		false, "Run full interface verification (UP + handshake + ping) matching production checks")
+	BenchCmd.Flags().DurationVar(&benchCmdArgs.timeout, "timeout",
+		5*time.Second, "HTTP timeout for each /connect request")
 }
 
 func runBench(cmd *cobra.Command, args []string) error {
@@ -127,6 +134,7 @@ func runBench(cmd *cobra.Command, args []string) error {
 		successCount int
 		failedCount  int
 		connectTimes []time.Duration
+		verifyTimes  []time.Duration
 	)
 
 	for result := range results {
@@ -136,12 +144,19 @@ func runBench(cmd *cobra.Command, args []string) error {
 		} else {
 			successCount++
 			connectTimes = append(connectTimes, result.ConnectDuration)
+			if result.VerifyDuration > 0 {
+				verifyTimes = append(verifyTimes, result.VerifyDuration)
+			}
 			hc := "skipped"
 			if result.HealthCheckPassed {
 				hc = "passed"
 			}
-			log.Printf("[%d] OK  connect=%v  healthcheck=%s\n",
-				result.Index, result.ConnectDuration, hc)
+			verify := "skipped"
+			if result.VerifyDuration > 0 {
+				verify = result.VerifyDuration.Round(time.Microsecond).String()
+			}
+			log.Printf("[%d] OK  connect=%v  verify=%s  healthcheck=%s\n",
+				result.Index, result.ConnectDuration, verify, hc)
 		}
 	}
 
@@ -167,8 +182,8 @@ func runBench(cmd *cobra.Command, args []string) error {
 			total += d
 		}
 		avg := total / time.Duration(len(connectTimes))
-		p50 := percentile(connectTimes, 50)
-		p99 := percentile(connectTimes, 99)
+		p50 := benchPercentile(connectTimes, 50)
+		p99 := benchPercentile(connectTimes, 99)
 
 		fmt.Println("───────────────────────────────────────")
 		fmt.Println("  Connect latency:")
@@ -177,6 +192,25 @@ func runBench(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    p50                 : %v\n", p50.Round(time.Microsecond))
 		fmt.Printf("    p99                 : %v\n", p99.Round(time.Microsecond))
 		fmt.Printf("    max                 : %v\n", connectTimes[len(connectTimes)-1].Round(time.Microsecond))
+
+		if len(verifyTimes) > 0 {
+			sort.Slice(verifyTimes, func(i, j int) bool { return verifyTimes[i] < verifyTimes[j] })
+			var vtotal time.Duration
+			for _, d := range verifyTimes {
+				vtotal += d
+			}
+			vavg := vtotal / time.Duration(len(verifyTimes))
+			vp50 := benchPercentile(verifyTimes, 50)
+			vp99 := benchPercentile(verifyTimes, 99)
+			fmt.Println("───────────────────────────────────────")
+			fmt.Println("  Verify latency (UP + handshake + ping):")
+			fmt.Printf("    avg                 : %v\n", vavg.Round(time.Microsecond))
+			fmt.Printf("    min                 : %v\n", verifyTimes[0].Round(time.Microsecond))
+			fmt.Printf("    p50                 : %v\n", vp50.Round(time.Microsecond))
+			fmt.Printf("    p99                 : %v\n", vp99.Round(time.Microsecond))
+			fmt.Printf("    max                 : %v\n", verifyTimes[len(verifyTimes)-1].Round(time.Microsecond))
+		}
+
 		fmt.Println("───────────────────────────────────────")
 		fmt.Printf("  Throughput            : %.1f conn/s\n", float64(successCount)/totalTime.Seconds())
 	}
@@ -188,8 +222,8 @@ func runBench(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// percentile returns the p-th percentile from a sorted slice of durations.
-func percentile(sorted []time.Duration, p int) time.Duration {
+// benchPercentile returns the p-th percentile from a sorted slice of durations.
+func benchPercentile(sorted []time.Duration, p int) time.Duration {
 	if len(sorted) == 0 {
 		return 0
 	}
@@ -228,7 +262,7 @@ func benchEstablishConnection(
 		Password: password,
 		WgClient: wgClient,
 		Http: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout: benchCmdArgs.timeout,
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 			},
@@ -259,6 +293,17 @@ func benchEstablishConnection(
 	if err != nil {
 		result.Error = fmt.Errorf("failed to connect: %v", err)
 		return result
+	}
+
+	// Run full interface verification (UP + handshake + ping) if requested.
+	if benchCmdArgs.verify {
+		verifyStart := time.Now()
+		err = client.VerifyInterface(ctx)
+		result.VerifyDuration = time.Since(verifyStart)
+		if err != nil {
+			result.Error = fmt.Errorf("verify failed: %v", err)
+			return result
+		}
 	}
 
 	if !benchCmdArgs.skipHealthCheck {
