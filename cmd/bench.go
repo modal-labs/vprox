@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os/signal"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -23,32 +24,35 @@ type ConnectionResult struct {
 	ConnectDuration   time.Duration
 	HealthCheckPassed bool
 	Error             error
-	Client            *lib.Client // Keep reference for cleanup
+	Client            *lib.Client
 }
 
 var BenchCmd = &cobra.Command{
-	Use:        "bench [flags] <ip>",
-	Short:      "Peer a client connection to a VPN server",
-	Args:       cobra.ExactArgs(1),
-	ArgAliases: []string{"ip"},
-	RunE:       runParallelConnect,
+	Use:   "bench [flags] <ip>",
+	Short: "Benchmark parallel VPN connections to a server",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runBench,
 }
+
 var benchCmdArgs struct {
-	ifname         string
+	ifprefix       string
 	numConnections int
+	skipHealthCheck bool
 }
 
 func init() {
-	BenchCmd.Flags().StringVar(&benchCmdArgs.ifname, "interface",
-		"vprox-bench-", "Interface name to proxy traffic through the VPN")
+	BenchCmd.Flags().StringVar(&benchCmdArgs.ifprefix, "interface",
+		"vbench", "Interface name prefix (suffixed with connection index)")
 	BenchCmd.Flags().IntVarP(&benchCmdArgs.numConnections, "num-connections", "n",
-		1, "Number of parallel connections to establish for benchmarking")
+		1, "Number of parallel connections to establish")
+	BenchCmd.Flags().BoolVar(&benchCmdArgs.skipHealthCheck, "skip-healthcheck",
+		false, "Skip the post-connect health check ping")
 }
 
-func runParallelConnect(cmd *cobra.Command, args []string) error {
+func runBench(cmd *cobra.Command, args []string) error {
 	serverIp, err := netip.ParseAddr(args[0])
 	if err != nil || !serverIp.Is4() {
-		return fmt.Errorf("invalid IP address %s", args[0])
+		return fmt.Errorf("invalid IPv4 address: %s", args[0])
 	}
 
 	password, err := lib.GetVproxPassword()
@@ -60,163 +64,166 @@ func runParallelConnect(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize wgctrl: %v", err)
 	}
+	defer wgClient.Close()
 
 	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer done()
 
-	if benchCmdArgs.numConnections == 1 {
-		// Single connection mode (original behavior)
-		return runSingleConnection(ctx, serverIp, password, wgClient)
+	numConns := benchCmdArgs.numConnections
+	if numConns < 1 {
+		return fmt.Errorf("num-connections must be >= 1, got %d", numConns)
 	}
 
-	// Benchmark mode with N parallel connections
-	return runParallelConnections(ctx, serverIp, password, wgClient, benchCmdArgs.numConnections)
-}
-
-func runSingleConnection(ctx context.Context, serverIp netip.Addr, password string, wgClient *wgctrl.Client) error {
-	key, err := lib.GetClientKey(benchCmdArgs.ifname)
-	if err != nil {
-		return fmt.Errorf("failed to load server key: %v", err)
+	// Validate that interface names will fit in IFNAMSIZ (15 chars).
+	longestIfname := fmt.Sprintf("%s%d", benchCmdArgs.ifprefix, numConns-1)
+	if len(longestIfname) > 15 {
+		return fmt.Errorf("interface name %q (%d chars) exceeds Linux 15-char limit; shorten --interface prefix",
+			longestIfname, len(longestIfname))
 	}
 
-	client := &lib.Client{
-		Key:      key,
-		Ifname:   benchCmdArgs.ifname,
-		ServerIp: serverIp,
-		Password: password,
-		WgClient: wgClient,
-		Http: &http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		},
-	}
+	log.Printf("Starting benchmark: %d parallel connection(s) to %v\n", numConns, serverIp)
 
-	err = client.CreateInterface()
-	if err != nil {
-		return err
-	}
-	defer client.DeleteInterface()
+	// Track all created clients so we can clean them up on signal or completion.
+	var clientsMu sync.Mutex
+	var clients []*lib.Client
 
-	err = client.Connect()
-	if err != nil {
-		return err
-	}
+	// Ensure cleanup always runs, even on ctrl-C.
+	defer func() {
+		clientsMu.Lock()
+		defer clientsMu.Unlock()
+		for _, c := range clients {
+			c.DeleteInterface()
+		}
+		if len(clients) > 0 {
+			log.Printf("Cleaned up %d interface(s)\n", len(clients))
+		}
+	}()
 
-	log.Println("Connected...")
-	if !client.CheckConnection(healthCheckTimeout, ctx) {
-		return fmt.Errorf("connection failed initial healthcheck after %v", healthCheckTimeout)
+	registerClient := func(c *lib.Client) {
+		clientsMu.Lock()
+		clients = append(clients, c)
+		clientsMu.Unlock()
 	}
-	return nil
-}
-
-func runParallelConnections(ctx context.Context, serverIp netip.Addr, password string, wgClient *wgctrl.Client, numConnections int) error {
-	log.Printf("Starting benchmark with %d parallel connections...\n", numConnections)
 
 	var wg sync.WaitGroup
-	results := make(chan ConnectionResult, numConnections)
+	results := make(chan ConnectionResult, numConns)
 	startTime := time.Now()
 
-	// Launch N goroutines to establish connections in parallel
-	for i := range numConnections {
+	for i := range numConns {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
-			result := establishConnection(ctx, index, serverIp, password, wgClient)
+			result := benchEstablishConnection(ctx, index, serverIp, password, wgClient, registerClient)
 			results <- result
 		}(i)
 	}
 
-	// Wait for all connections to complete
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Collect and display results
 	var (
-		successCount     int
-		failedCount      int
-		totalConnectTime time.Duration
-		minConnectTime   time.Duration
-		maxConnectTime   time.Duration
-		clients          []*lib.Client
+		successCount int
+		failedCount  int
+		connectTimes []time.Duration
 	)
 
 	for result := range results {
 		if result.Error != nil {
 			failedCount++
-			log.Printf("[Connection %d] FAILED: %v\n", result.Index, result.Error)
+			log.Printf("[%d] FAILED: %v\n", result.Index, result.Error)
 		} else {
 			successCount++
-			log.Printf("[Connection %d] SUCCESS: Connect=%v, HealthCheck=%v\n",
-				result.Index, result.ConnectDuration, result.HealthCheckPassed)
-
-			totalConnectTime += result.ConnectDuration
-			if minConnectTime == 0 || result.ConnectDuration < minConnectTime {
-				minConnectTime = result.ConnectDuration
+			connectTimes = append(connectTimes, result.ConnectDuration)
+			hc := "skipped"
+			if result.HealthCheckPassed {
+				hc = "passed"
 			}
-			if result.ConnectDuration > maxConnectTime {
-				maxConnectTime = result.ConnectDuration
-			}
-
-			// Store client for cleanup
-			if result.Client != nil {
-				clients = append(clients, result.Client)
-			}
+			log.Printf("[%d] OK  connect=%v  healthcheck=%s\n",
+				result.Index, result.ConnectDuration, hc)
 		}
 	}
 
 	totalTime := time.Since(startTime)
 
-	// Print benchmark summary
-	fmt.Println("\nBENCHMARK SUMMARY")
-	fmt.Printf("Total Connections Attempted: %d\n", numConnections)
-	fmt.Printf("Successful:                  %d\n", successCount)
-	fmt.Printf("Failed:                      %d\n", failedCount)
-	fmt.Printf("Success Rate:                %.2f%%\n", float64(successCount)/float64(numConnections)*100)
-	fmt.Println()
-	fmt.Printf("Total Benchmark Time:        %v\n", totalTime)
-	if successCount > 0 {
-		avgConnectTime := totalConnectTime / time.Duration(successCount)
-		fmt.Printf("Average Connect Time:        %v\n", avgConnectTime)
-		fmt.Printf("Min Connect Time:            %v\n", minConnectTime)
-		fmt.Printf("Max Connect Time:            %v\n", maxConnectTime)
-		fmt.Printf("Connections/Second:          %.2f\n", float64(successCount)/totalTime.Seconds())
-	}
+	// Sort for percentile calculations.
+	sort.Slice(connectTimes, func(i, j int) bool { return connectTimes[i] < connectTimes[j] })
 
-	// Clean up all successful connections
-	for _, client := range clients {
-		if client != nil {
-			client.DeleteInterface()
+	fmt.Println()
+	fmt.Println("═══════════════════════════════════════")
+	fmt.Println("           BENCHMARK SUMMARY")
+	fmt.Println("═══════════════════════════════════════")
+	fmt.Printf("  Connections attempted : %d\n", numConns)
+	fmt.Printf("  Successful            : %d\n", successCount)
+	fmt.Printf("  Failed                : %d\n", failedCount)
+	fmt.Printf("  Success rate          : %.1f%%\n", float64(successCount)/float64(numConns)*100)
+	fmt.Println("───────────────────────────────────────")
+	fmt.Printf("  Total wall-clock time : %v\n", totalTime.Round(time.Millisecond))
+
+	if len(connectTimes) > 0 {
+		var total time.Duration
+		for _, d := range connectTimes {
+			total += d
 		}
+		avg := total / time.Duration(len(connectTimes))
+		p50 := percentile(connectTimes, 50)
+		p99 := percentile(connectTimes, 99)
+
+		fmt.Println("───────────────────────────────────────")
+		fmt.Println("  Connect latency:")
+		fmt.Printf("    avg                 : %v\n", avg.Round(time.Microsecond))
+		fmt.Printf("    min                 : %v\n", connectTimes[0].Round(time.Microsecond))
+		fmt.Printf("    p50                 : %v\n", p50.Round(time.Microsecond))
+		fmt.Printf("    p99                 : %v\n", p99.Round(time.Microsecond))
+		fmt.Printf("    max                 : %v\n", connectTimes[len(connectTimes)-1].Round(time.Microsecond))
+		fmt.Println("───────────────────────────────────────")
+		fmt.Printf("  Throughput            : %.1f conn/s\n", float64(successCount)/totalTime.Seconds())
 	}
+	fmt.Println("═══════════════════════════════════════")
 
 	if failedCount > 0 {
-		return fmt.Errorf("%d out of %d connections failed", failedCount, numConnections)
+		return fmt.Errorf("%d out of %d connections failed", failedCount, numConns)
 	}
-
 	return nil
 }
 
-func establishConnection(ctx context.Context, index int, serverIp netip.Addr, password string, wgClient *wgctrl.Client) ConnectionResult {
+// percentile returns the p-th percentile from a sorted slice of durations.
+func percentile(sorted []time.Duration, p int) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := len(sorted) * p / 100
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
+func benchEstablishConnection(
+	ctx context.Context,
+	index int,
+	serverIp netip.Addr,
+	password string,
+	wgClient *wgctrl.Client,
+	registerClient func(*lib.Client),
+) ConnectionResult {
+	ifname := fmt.Sprintf("%s%d", benchCmdArgs.ifprefix, index)
+
 	result := ConnectionResult{
 		Index:  index,
-		Ifname: fmt.Sprintf("%s-%d", connectCmdArgs.ifname, index),
+		Ifname: ifname,
 	}
 
-	// Load client key
-	key, err := lib.GetClientKey(result.Ifname)
+	key, err := lib.GetClientKey(ifname)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to load client key: %v", err)
 		return result
 	}
 
-	// Create client
 	client := &lib.Client{
 		Key:      key,
-		Ifname:   result.Ifname,
+		Ifname:   ifname,
 		ServerIp: serverIp,
 		Password: password,
 		WgClient: wgClient,
@@ -228,33 +235,41 @@ func establishConnection(ctx context.Context, index int, serverIp netip.Addr, pa
 		},
 	}
 
-	// Create interface
 	err = client.CreateInterface()
 	if err != nil {
 		result.Error = fmt.Errorf("failed to create interface: %v", err)
 		return result
 	}
 
-	// Measure connection time
+	// Register immediately so cleanup runs even if we fail below.
+	registerClient(client)
+
+	// Check for cancellation before attempting the (potentially slow) connect.
+	select {
+	case <-ctx.Done():
+		result.Error = fmt.Errorf("cancelled before connect")
+		return result
+	default:
+	}
+
 	connectStart := time.Now()
 	err = client.Connect()
 	result.ConnectDuration = time.Since(connectStart)
 
 	if err != nil {
-		client.DeleteInterface()
 		result.Error = fmt.Errorf("failed to connect: %v", err)
 		return result
 	}
 
-	// Run health check
-	result.HealthCheckPassed = client.CheckConnection(healthCheckTimeout, ctx)
-	if !result.HealthCheckPassed {
-		client.DeleteInterface()
-		result.Error = fmt.Errorf("health check failed")
-		return result
+	if !benchCmdArgs.skipHealthCheck {
+		result.HealthCheckPassed = client.CheckConnection(healthCheckTimeout, ctx)
+		if !result.HealthCheckPassed {
+			result.Error = fmt.Errorf("health check failed")
+			return result
+		}
+	} else {
+		result.HealthCheckPassed = true
 	}
 
-	// Return client for cleanup later
-	result.Client = client
 	return result
 }
