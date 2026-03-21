@@ -41,16 +41,12 @@ func testServerWithWg(t *testing.T, cidr netip.Prefix, index uint16) (*Server, f
 	key, err := wgtypes.GeneratePrivateKey()
 	require.NoError(t, err)
 
-	wgClient, err := wgctrl.New()
-	require.NoError(t, err)
-
 	srv := &Server{
 		Key:      key,
 		BindAddr: netip.MustParseAddr("127.0.0.1"),
 		Password: "test-secret",
 		Index:    index,
 		WgCidr:   cidr,
-		WgClient: wgClient,
 		Ctx:      context.Background(),
 	}
 
@@ -60,14 +56,12 @@ func testServerWithWg(t *testing.T, cidr netip.Prefix, index uint16) (*Server, f
 	srv.ipAllocator = NewIpAllocator(cidr)
 	_ = srv.ipAllocator.Allocate() // reserve the network address
 	srv.peers = make(map[wgtypes.Key]peerState)
-	srv.pendingPeers = make(chan wgtypes.PeerConfig, 4096)
-	srv.flushDone = make(chan struct{})
+	srv.MaxPeers = DefaultMaxPeers
 
-	// Create the WireGuard interface.
+	// Create a single WireGuard interface.
 	ifname := srv.Ifname()
 	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
-	// Remove any leftover from a previous failed run.
-	_ = netlink.LinkDel(link)
+	_ = netlink.LinkDel(link) // remove any leftover from a previous failed run
 
 	err = netlink.LinkAdd(link)
 	require.NoError(t, err, "failed to create WireGuard interface (are you root?)")
@@ -79,6 +73,9 @@ func testServerWithWg(t *testing.T, cidr netip.Prefix, index uint16) (*Server, f
 	err = netlink.LinkSetUp(link)
 	require.NoError(t, err)
 
+	wgClient, err := wgctrl.New()
+	require.NoError(t, err)
+
 	listenPort := WireguardListenPortBase + int(index)
 	err = wgClient.ConfigureDevice(ifname, wgtypes.Config{
 		PrivateKey: &key,
@@ -86,12 +83,35 @@ func testServerWithWg(t *testing.T, cidr netip.Prefix, index uint16) (*Server, f
 	})
 	require.NoError(t, err)
 
-	// Start the flush loop so enqueued peers actually get registered.
-	go srv.flushPeersLoop()
+	// Create a dedicated cleanup client (not used by tests directly, but
+	// needed if removeIdlePeers is ever called).
+	srv.cleanupClient, err = wgctrl.New()
+	require.NoError(t, err)
+
+	// Create NumShards netlink clients, all targeting the same interface.
+	srv.shards = make([]*wgShard, NumShards)
+	for i := 0; i < NumShards; i++ {
+		shardClient, err := wgctrl.New()
+		require.NoError(t, err)
+
+		srv.shards[i] = &wgShard{
+			wgClient:     shardClient,
+			pendingPeers: make(chan pendingPeer, 4096),
+			flushDone:    make(chan struct{}),
+		}
+
+		go srv.flushPeersLoop(srv.shards[i])
+	}
 
 	cleanup := func() {
-		close(srv.pendingPeers)
-		<-srv.flushDone
+		for _, shard := range srv.shards {
+			close(shard.pendingPeers)
+			<-shard.flushDone
+			_ = shard.wgClient.Close()
+		}
+		if srv.cleanupClient != nil {
+			_ = srv.cleanupClient.Close()
+		}
 		_ = netlink.LinkDel(link)
 		_ = wgClient.Close()
 	}

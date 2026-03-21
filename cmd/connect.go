@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -83,7 +84,10 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	defer client.DeleteInterface()
 
 	err = client.Connect()
-	if err != nil {
+	if errors.Is(err, lib.ErrResourceExhausted) {
+		log.Printf("Server at capacity — cannot accept new connections. Exiting.")
+		return err
+	} else if err != nil {
 		return err
 	}
 
@@ -114,6 +118,10 @@ func runConnect(cmd *cobra.Command, args []string) error {
 				if err == nil {
 					log.Println("Reconnected...")
 					break unhealthy_loop
+				}
+				if errors.Is(err, lib.ErrResourceExhausted) {
+					log.Printf("Server at capacity — cannot reconnect. Exiting.")
+					return err
 				}
 
 				select {

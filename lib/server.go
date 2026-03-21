@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -28,6 +29,10 @@ const FwmarkBase = 0x54437D00
 // UDP listen port base value for WireGuard connections.
 const WireguardListenPortBase = 50227
 
+// DefaultMaxPeers is the default maximum number of active peers a server will
+// accept before returning 429 Too Many Requests.
+const DefaultMaxPeers = 10000
+
 // A new peer must connect with a handshake within this time.
 const FirstHandshakeTimeout = 10 * time.Second
 
@@ -40,11 +45,36 @@ const FirstHandshakeTimeout = 10 * time.Second
 // setting.
 const PeerIdleTimeout = 5 * time.Minute
 
+// NumShards is the number of parallel netlink sockets (wgctrl.Clients) each
+// Server uses for WireGuard peer operations. All shards target the same
+// single WireGuard interface, but each has its own netlink connection so
+// ConfigureDevice calls can proceed in parallel.
+const NumShards = 4
+
 // peerState tracks per-peer metadata kept in memory so the connect handler can
 // avoid expensive netlink round-trips for duplicate checks.
 type peerState struct {
 	IP        netip.Addr
 	CreatedAt time.Time
+}
+
+// pendingPeer wraps a WireGuard peer config with a done channel so the HTTP
+// handler can wait for the flush loop to actually register the peer in
+// WireGuard before returning the response to the client. This prevents a
+// race where the client starts handshaking before the server has registered
+// the peer.
+type pendingPeer struct {
+	config wgtypes.PeerConfig
+	done   chan error // closed (with nil) on success, or receives an error
+}
+
+// wgShard owns its own netlink socket (wgctrl.Client) for parallel I/O to the
+// single shared WireGuard interface. Multiple shards avoid the per-connection
+// mutex in the netlink library that would otherwise serialise all operations.
+type wgShard struct {
+	wgClient     *wgctrl.Client
+	pendingPeers chan pendingPeer
+	flushDone    chan struct{}
 }
 
 // Server handles state for one WireGuard network.
@@ -53,6 +83,11 @@ type peerState struct {
 // private IP that the server should bind to.
 type Server struct {
 	// Key is the private key of the server.
+	// MaxPeers is the maximum number of concurrent peers. When len(peers)
+	// reaches this limit, new /connect requests receive 429. Zero means use
+	// DefaultMaxPeers.
+	MaxPeers int
+
 	Key wgtypes.Key
 
 	// BindAddr is the private IPv4 address that the server binds to.
@@ -73,7 +108,9 @@ type Server struct {
 	// Ipt is the iptables client for managing firewall rules.
 	Ipt *iptables.IPTables
 
-	// WgClient is a shared client for interacting with the WireGuard kernel module.
+	// WgClient is used only for the initial ConfigureDevice in StartWireguard
+	// (setting the private key / listen port). Per-shard clients handle
+	// ongoing peer operations.
 	WgClient *wgctrl.Client
 
 	// WgCidr is the CIDR block of IPs that the server assigns to WireGuard peers.
@@ -87,11 +124,9 @@ type Server struct {
 	mu    sync.Mutex // Protects the fields below.
 	peers map[wgtypes.Key]peerState
 
-	// pendingPeers receives peer configs that need to be flushed to WireGuard.
-	// The flushPeersLoop drains this channel and batches them into single
-	// ConfigureDevice calls.
-	pendingPeers chan wgtypes.PeerConfig
-	flushDone    chan struct{} // closed when flushPeersLoop exits
+	shards      []*wgShard    // NumShards netlink clients for parallel flush
+	shardNext   atomic.Uint64 // round-robin counter for shard selection
+	cleanupClient *wgctrl.Client // dedicated netlink client for removeIdlePeers
 }
 
 // InitState initializes the private server state.
@@ -111,9 +146,20 @@ func (srv *Server) InitState() error {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
 	srv.peers = make(map[wgtypes.Key]peerState)
-	srv.pendingPeers = make(chan wgtypes.PeerConfig, 4096)
-	srv.flushDone = make(chan struct{})
+	if srv.MaxPeers == 0 {
+		maxPeers, err := GetMaxPeers()
+		if err != nil {
+			return fmt.Errorf("invalid max peers configuration: %v", err)
+		}
+		srv.MaxPeers = maxPeers
+	}
 	return nil
+}
+
+// pickShard returns the next shard via round-robin.
+func (srv *Server) pickShard() *wgShard {
+	idx := srv.shardNext.Add(1) - 1
+	return srv.shards[idx%uint64(len(srv.shards))]
 }
 
 func (srv *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
@@ -166,6 +212,22 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Fast path: check the in-memory map for an existing allocation.
 	srv.mu.Lock()
+
+	// Capacity check — reject before allocating if at the limit.
+	// Existing peers (reconnects) are exempt.
+	if _, reconnect := srv.peers[peerKey]; !reconnect && len(srv.peers) >= srv.MaxPeers {
+		srv.mu.Unlock()
+		log.Printf("[%v] at peer capacity (%d/%d), rejecting %v",
+			srv.BindAddr, len(srv.peers), srv.MaxPeers, peerKey)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "resource_exhausted",
+			"message": fmt.Sprintf("server at capacity (%d peers)", srv.MaxPeers),
+		})
+		return
+	}
+
 	if existing, ok := srv.peers[peerKey]; ok {
 		srv.mu.Unlock()
 
@@ -184,8 +246,8 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// New peer — allocate an IP while still holding the lock so no two
-	// goroutines can race on the same key.
+	// New peer — allocate an IP and pick a shard while still holding the
+	// lock so no two goroutines can race on the same key.
 	peerIp := srv.ipAllocator.Allocate()
 	if peerIp.IsUnspecified() {
 		srv.mu.Unlock()
@@ -193,19 +255,44 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
 		return
 	}
+	shard := srv.pickShard()
 	srv.peers[peerKey] = peerState{IP: peerIp, CreatedAt: time.Now()}
 	srv.mu.Unlock()
 
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
 	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
 
-	// Enqueue the peer for batched WireGuard registration. The flushPeersLoop
-	// coalesces multiple pending peers into a single ConfigureDevice netlink
-	// call, avoiding the serialization bottleneck that caused timeouts.
-	srv.pendingPeers <- wgtypes.PeerConfig{
-		PublicKey:         peerKey,
-		ReplaceAllowedIPs: true,
-		AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
+	// Enqueue the peer for batched WireGuard registration and wait for the
+	// flush loop to confirm it's registered. This ensures the server's
+	// WireGuard device knows about the peer BEFORE we return the response,
+	// so the client doesn't start handshaking against an unregistered peer.
+	pp := pendingPeer{
+		config: wgtypes.PeerConfig{
+			PublicKey:         peerKey,
+			ReplaceAllowedIPs: true,
+			AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
+		},
+		done: make(chan error, 1),
+	}
+
+	// Non-blocking send: if the shard's channel is full, reject immediately.
+	select {
+	case shard.pendingPeers <- pp:
+		// enqueued successfully
+	default:
+		srv.mu.Lock()
+		delete(srv.peers, peerKey)
+		srv.mu.Unlock()
+		srv.ipAllocator.Free(peerIp)
+		log.Printf("[%v] peer queue full, rejecting %v", srv.BindAddr, peerKey)
+		http.Error(w, "server busy, try again", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Wait for the flush loop to confirm the peer is registered in WireGuard.
+	if flushErr := <-pp.done; flushErr != nil {
+		http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
+		return
 	}
 
 	// Return the assigned IP address and the server's public key.
@@ -261,16 +348,67 @@ func (srv *Server) StartWireguard() error {
 		return err
 	}
 
+	// Create a dedicated netlink client for removeIdlePeers so that its
+	// (potentially heavy) Device() and ConfigureDevice() calls never block
+	// the flush shards.
+	srv.cleanupClient, err = wgctrl.New()
+	if err != nil {
+		netlink.LinkDel(link)
+		return fmt.Errorf("failed to create cleanup wgctrl client: %v", err)
+	}
+
+	// Create NumShards netlink clients, each with its own socket, all
+	// targeting the same WireGuard interface. This parallelises
+	// ConfigureDevice calls that would otherwise serialise on a single
+	// netlink connection mutex.
+	srv.shards = make([]*wgShard, NumShards)
+	for i := 0; i < NumShards; i++ {
+		shardClient, err := wgctrl.New()
+		if err != nil {
+			srv.cleanupShards(i)
+			srv.cleanupClient.Close()
+			netlink.LinkDel(link)
+			return fmt.Errorf("failed to create wgctrl client for shard %d: %v", i, err)
+		}
+		srv.shards[i] = &wgShard{
+			wgClient:     shardClient,
+			pendingPeers: make(chan pendingPeer, 4096),
+			flushDone:    make(chan struct{}),
+		}
+	}
+
+	log.Printf("[%v] created WireGuard interface %s with %d netlink shards + 1 cleanup client", srv.BindAddr, ifname, NumShards)
 	return nil
 }
 
-func (srv *Server) CleanupWireguard() {
-	// Close the channel to signal the flush loop to drain and exit, then
-	// wait for it to finish so all peers are registered before we delete
-	// the interface.
-	close(srv.pendingPeers)
-	<-srv.flushDone
+// cleanupShards closes shard clients [0, upTo) during a partial setup failure.
+func (srv *Server) cleanupShards(upTo int) {
+	for j := 0; j < upTo; j++ {
+		if srv.shards[j] != nil {
+			close(srv.shards[j].pendingPeers)
+			<-srv.shards[j].flushDone
+			srv.shards[j].wgClient.Close()
+		}
+	}
+}
 
+func (srv *Server) CleanupWireguard() {
+	// Shut down all shard flush loops and close their netlink clients.
+	for _, shard := range srv.shards {
+		if shard == nil {
+			continue
+		}
+		close(shard.pendingPeers)
+		<-shard.flushDone
+		shard.wgClient.Close()
+	}
+
+	// Close the dedicated cleanup client.
+	if srv.cleanupClient != nil {
+		srv.cleanupClient.Close()
+	}
+
+	// Delete the single WireGuard interface.
 	ifname := srv.Ifname()
 	_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
 }
@@ -346,20 +484,26 @@ func (srv *Server) StartIptables() error {
 
 func (srv *Server) CleanupIptables() {
 	if err := srv.iptablesInputFwmarkRule(false); err != nil {
-		log.Printf("warning: error cleaning up IP tables: failed to add fwmark rule: %v\n", err)
+		log.Printf("warning: error cleaning up IP tables: failed to remove fwmark rule: %v\n", err)
 	}
 	if err := srv.iptablesSnatRule(false); err != nil {
-		log.Printf("warning: error cleaning up IP tables: failed to add SNAT rule: %v\n", err)
+		log.Printf("warning: error cleaning up IP tables: failed to remove SNAT rule: %v\n", err)
+	}
+	if err := srv.iptablesMssRule(false); err != nil {
+		log.Printf("warning: error cleaning up IP tables: failed to remove MSS rule: %v\n", err)
 	}
 }
 
 func (srv *Server) removeIdlePeersLoop() {
 	for {
-		// Wait for up to 5 seconds, or stop when the context is done.
+		// Wait for up to 1 second, or stop when the context is done.
+		// A short interval keeps the WireGuard peer list small under
+		// sustained load, which in turn keeps Device() and
+		// ConfigureDevice() fast for the flush shards.
 		select {
 		case <-srv.Ctx.Done():
 			return
-		case <-time.After(5 * time.Second):
+		case <-time.After(1 * time.Second):
 		}
 
 		if err := srv.removeIdlePeers(); err != nil {
@@ -369,16 +513,20 @@ func (srv *Server) removeIdlePeersLoop() {
 }
 
 func (srv *Server) removeIdlePeers() error {
-	device, err := srv.WgClient.Device(srv.Ifname())
+	// Use the dedicated cleanup client so that the (potentially heavy)
+	// Device() and ConfigureDevice() calls here never block any flush
+	// shard's netlink socket.
+	device, err := srv.cleanupClient.Device(srv.Ifname())
 	if err != nil {
 		return fmt.Errorf("failed to get WireGuard device: %v", err)
 	}
 
-	// Hold the lock for access to peers.
+	// Build the removal list under the lock, but release it before the
+	// (potentially slow) ConfigureDevice netlink call so that the connect
+	// handler isn't blocked.
 	srv.mu.Lock()
-	defer srv.mu.Unlock()
 
-	// Clean up old entries from peers map, which should have connected by now.
+	// Clean up old entries from peers map.
 	for key, ps := range srv.peers {
 		if time.Since(ps.CreatedAt) > PeerIdleTimeout {
 			delete(srv.peers, key)
@@ -387,21 +535,32 @@ func (srv *Server) removeIdlePeers() error {
 
 	var removePeers []wgtypes.PeerConfig
 	var removeIps []netip.Addr
+	var noHandshakeCount int
 	for _, peer := range device.Peers {
 		var idle bool
 		if peer.LastHandshakeTime.IsZero() {
-			_, isNew := srv.peers[peer.PublicKey]
-			idle = !isNew
+			// Never completed a handshake. Use FirstHandshakeTimeout (10 s)
+			// instead of PeerIdleTimeout (5 min) — if the client hasn't
+			// handshaked by now it never will, and letting these accumulate
+			// causes the Device() payload and removal batches to grow
+			// unboundedly under sustained load.
+			ps, isNew := srv.peers[peer.PublicKey]
+			if isNew {
+				idle = time.Since(ps.CreatedAt) > FirstHandshakeTimeout
+			} else {
+				idle = true // not in our map at all, remove it
+			}
 		} else {
 			idle = time.Since(peer.LastHandshakeTime) > PeerIdleTimeout
 		}
 
 		if idle {
+			if peer.LastHandshakeTime.IsZero() {
+				noHandshakeCount++
+			}
 			if len(peer.AllowedIPs) > 0 {
 				ipv4 := peer.AllowedIPs[0].IP.To4()
 				if ipv4 != nil {
-					log.Printf("[%v] removing idle peer at %v: %v",
-						srv.BindAddr, ipv4, peer.PublicKey)
 					removeIps = append(removeIps, netip.AddrFrom4([4]byte(ipv4)))
 				}
 			}
@@ -412,14 +571,23 @@ func (srv *Server) removeIdlePeers() error {
 		}
 	}
 
+	srv.mu.Unlock()
+
 	if len(removePeers) > 0 {
-		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removePeers})
+		log.Printf("[%v] removing %d idle peer(s) (%d never handshaked, %d timed out)",
+			srv.BindAddr, len(removePeers), noHandshakeCount, len(removePeers)-noHandshakeCount)
+		err := srv.cleanupClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removePeers})
 		if err != nil {
 			return err
 		}
+
+		// Re-lock to update in-memory state after the netlink call.
+		srv.mu.Lock()
 		for _, p := range removePeers {
 			delete(srv.peers, p.PublicKey)
 		}
+		srv.mu.Unlock()
+
 		for _, ip := range removeIps {
 			srv.ipAllocator.Free(ip)
 		}
@@ -455,7 +623,9 @@ func (srv *Server) ListenForHttps() error {
 	}
 
 	go srv.removeIdlePeersLoop()
-	go srv.flushPeersLoop()
+	for _, shard := range srv.shards {
+		go srv.flushPeersLoop(shard)
+	}
 
 	// Some bind addresses may not have been added to the network interface. If
 	// that is the case, we need to add it (transiently).
@@ -503,61 +673,108 @@ func (srv *Server) ListenForHttps() error {
 	}
 }
 
-// flushPeersLoop drains srv.pendingPeers and batches peer configs into single
-// ConfigureDevice netlink calls. After receiving the first peer, it waits up
-// to 1 ms for more to arrive, then flushes them all at once. This turns N
-// concurrent /connect requests into 1 netlink call with N peers.
-func (srv *Server) flushPeersLoop() {
-	defer close(srv.flushDone)
+// maxFlushBatch caps the number of peers flushed in a single ConfigureDevice
+// call. This bounds the size of the netlink message and keeps the socket
+// available for removeIdlePeers.
+const maxFlushBatch = 256
+
+// flushPeersLoop drains shard.pendingPeers and batches peer configs into single
+// ConfigureDevice netlink calls via the shard's own netlink socket. All shards
+// target the same WireGuard interface but use separate sockets for parallelism.
+//
+// Adaptive batching strategy:
+//   - Block on the channel until the first peer arrives (zero overhead at low load).
+//   - Non-blocking drain: grab everything already queued without waiting.
+//   - If the drain found more peers (channel was busy), do a short 1 ms yield
+//     to let in-flight HTTP handlers finish and enqueue, then drain again.
+//   - Flush once the channel is empty or the batch hits maxFlushBatch.
+//
+// After each flush, all waiting HTTP handlers are unblocked via their done
+// channels, so the client only receives its response after the peer is
+// registered in WireGuard.
+func (srv *Server) flushPeersLoop(shard *wgShard) {
+	defer close(shard.flushDone)
 
 	for {
 		// Block until the first peer arrives or the channel is closed.
-		first, ok := <-srv.pendingPeers
+		first, ok := <-shard.pendingPeers
 		if !ok {
 			return // channel closed, we're shutting down
 		}
 
-		// Collect as many additional peers as are immediately available,
-		// up to a short deadline to allow a burst to accumulate.
-		batch := []wgtypes.PeerConfig{first}
-		deadline := time.After(1 * time.Millisecond)
-	drain:
-		for {
-			select {
-			case p, ok := <-srv.pendingPeers:
-				if !ok {
-					// Channel closed mid-batch; flush what we have and exit.
-					srv.flushPeerBatch(batch)
-					return
-				}
-				batch = append(batch, p)
-			case <-deadline:
-				break drain
+		batch := []pendingPeer{first}
+
+		// Non-blocking drain: grab everything already in the channel.
+		batch, closed := drainPending(shard.pendingPeers, batch, maxFlushBatch)
+		if closed {
+			srv.flushShardBatch(shard, batch)
+			return
+		}
+
+		// If we picked up extra peers the channel is busy — yield briefly
+		// so in-flight handlers can enqueue, then drain once more.
+		if len(batch) > 1 && len(batch) < maxFlushBatch {
+			time.Sleep(1 * time.Millisecond)
+			batch, closed = drainPending(shard.pendingPeers, batch, maxFlushBatch)
+			if closed {
+				srv.flushShardBatch(shard, batch)
+				return
 			}
 		}
 
-		srv.flushPeerBatch(batch)
+		srv.flushShardBatch(shard, batch)
 	}
 }
 
-// flushPeerBatch sends a batch of peer configs to WireGuard in a single
-// netlink call. On failure, it rolls back the in-memory state for each peer.
-func (srv *Server) flushPeerBatch(batch []wgtypes.PeerConfig) {
-	err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
-		Peers: batch,
+// drainPending does a non-blocking drain of ch into batch, stopping when the
+// channel is empty or the batch reaches maxSize. Returns the (possibly grown)
+// batch and whether the channel was closed.
+func drainPending(ch <-chan pendingPeer, batch []pendingPeer, maxSize int) ([]pendingPeer, bool) {
+	for len(batch) < maxSize {
+		select {
+		case p, ok := <-ch:
+			if !ok {
+				return batch, true
+			}
+			batch = append(batch, p)
+		default:
+			return batch, false
+		}
+	}
+	return batch, false
+}
+
+// flushShardBatch sends a batch of peer configs to WireGuard via the shard's
+// own netlink socket, then signals all waiting HTTP handlers via their done
+// channels. On failure, it rolls back the in-memory state.
+func (srv *Server) flushShardBatch(shard *wgShard, batch []pendingPeer) {
+	// Extract the wgtypes.PeerConfig slice for the netlink call.
+	configs := make([]wgtypes.PeerConfig, len(batch))
+	for i, pp := range batch {
+		configs[i] = pp.config
+	}
+
+	err := shard.wgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
+		Peers: configs,
 	})
 	if err != nil {
 		log.Printf("failed to configure %d WireGuard peer(s): %v", len(batch), err)
 		srv.mu.Lock()
-		for _, p := range batch {
-			if ps, ok := srv.peers[p.PublicKey]; ok {
+		for _, pp := range batch {
+			if ps, ok := srv.peers[pp.config.PublicKey]; ok {
 				srv.ipAllocator.Free(ps.IP)
-				delete(srv.peers, p.PublicKey)
+				delete(srv.peers, pp.config.PublicKey)
 			}
 		}
 		srv.mu.Unlock()
 	} else if len(batch) > 1 {
-		log.Printf("[%v] flushed %d peers to WireGuard in one call", srv.BindAddr, len(batch))
+		log.Printf("[%v] flushed %d peers in one call", srv.BindAddr, len(batch))
+	}
+
+	// Signal all waiting handlers. On success err is nil; on failure each
+	// handler gets the error.
+	for _, pp := range batch {
+		pp.done <- err
 	}
 }
 

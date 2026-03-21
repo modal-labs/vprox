@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +26,10 @@ const (
 	verifyPollInterval = 100 * time.Millisecond
 	verifyStepTimeout  = 10 * time.Second
 )
+
+// ErrResourceExhausted is returned when the server has reached its maximum
+// number of active peers and cannot accept new connections.
+var ErrResourceExhausted = errors.New("server at capacity: too many active peers")
 
 // Client manages a peering connection with with a local WireGuard interface.
 type Client struct {
@@ -149,8 +154,13 @@ func (c *Client) sendConnectionRequest() (connectResponse, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return connectResponse{}, ErrResourceExhausted
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		return connectResponse{}, fmt.Errorf("server returned status %v", resp.Status)
+		body, _ := io.ReadAll(resp.Body)
+		return connectResponse{}, fmt.Errorf("server returned status %v: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 
 	buf, err = io.ReadAll(resp.Body)
