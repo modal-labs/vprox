@@ -1,8 +1,8 @@
 # vprox
 
-vprox is a high-performance network proxy acting as a split tunnel VPN. The server accepts peering requests from clients, which then establish WireGuard tunnels that direct all traffic on the client's network interface through the server, with IP masquerading.
+vprox is a high-performance network proxy acting as a split tunnel VPN. The server accepts peering requests from clients, which then establish WireGuard tunnels that direct all traffic on the client's network interface through the server, with IP masquerading. It also supports **edge connectors** that allow clients to reach private resources inside a remote VPC through the server.
 
-Both the client and server commands need root access. The server can have multiple public IP addresses attached, and on cloud providers, it automatically uses the instance metadata endpoint to discover its public IP addresses and start one proxy for each.
+Both the client, server, and edge commands need root access. The server can have multiple public IP addresses attached, and on cloud providers, it automatically uses the instance metadata endpoint to discover its public IP addresses and start one proxy for each.
 
 This property allows the server to be high-availability. In the event of a restart or network partition, the tunnels remain open. If the server's IP address is attached to a new host, clients will automatically re-establish connections. This means that IP addresses can be moved to different hosts in event of an outage.
 
@@ -135,6 +135,76 @@ Note that Machine B must be able to send UDP packets to port 50227 on Machine A,
 
 All outbound network traffic seen by `vprox0` will automatically be forwarded through the WireGuard tunnel. The VPN server masquerades the source IP address.
 
+### Edge Connector
+
+The `vprox edge` command deploys an edge connector inside a customer's VPC that makes an **outbound** connection to a vprox server and acts as an exit node into the local network. This allows `connect` clients to access private resources (databases, internal APIs, etc.) in the remote VPC through the server — without opening any inbound ports in the customer's network.
+
+```
+                         WireGuard                          WireGuard
+┌──────────────┐        UDP tunnel        ┌──────────────┐  UDP tunnel  ┌──────────────────┐
+│              │◄────────────────────────► │              │◄────────────►│                  │
+│  connect     │  routes all traffic      │  vprox       │  advertises  │  edge connector  │
+│  client      │  through server          │  server      │  10.0.5.0/24 │  (customer VPC)  │
+│              │                          │  (public)    │              │                  │
+└──────────────┘                          └──────────────┘              └────────┬─────────┘
+  Sees 10.0.5.x                            Routes 10.0.5.0/24                  │
+  traffic go through                       toward edge peer             ┌───────┴────────┐
+  the tunnel                                                            │  Private        │
+                                                                        │  resources      │
+                                                                        │  10.0.5.0/24    │
+                                                                        └────────────────┘
+```
+
+**How it works:**
+
+1. The edge connector makes an outbound HTTPS request to the server (`POST /edge-connect`), advertising which CIDR routes it can reach.
+2. The server registers the edge as a WireGuard peer with `AllowedIPs` set to both the peer's tunnel address and the advertised routes.
+3. When a `connect` client sends a packet to a private IP (e.g. `10.0.5.100`), the server's WireGuard interface routes it to the edge peer.
+4. The edge connector receives the packet, masquerades the source IP, and forwards it into the local VPC network.
+5. Replies follow the same path in reverse.
+
+**Edge setup (inside customer VPC):**
+
+On the edge host, install system requirements:
+
+```bash
+# On Amazon Linux
+sudo dnf install -y iptables wireguard-tools
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo sysctl -w net.ipv4.conf.all.rp_filter=2
+```
+
+Then start the edge connector, pointing it at the vprox server and advertising the local routes:
+
+```bash
+# [Machine C: inside customer VPC, can reach 10.0.5.0/24]
+VPROX_PASSWORD=my-password vprox edge 1.2.3.4 \
+  --routes 10.0.5.0/24 \
+  --interface vprox-edge0
+```
+
+**Full three-machine example:**
+
+```bash
+# [Machine A: vprox server, public IP 1.2.3.4, private IP 172.31.64.125]
+VPROX_PASSWORD=my-password vprox server --ip 172.31.64.125 --wg-block 240.1.0.0/16
+
+# [Machine C: edge connector in customer VPC, can reach 10.0.5.0/24]
+VPROX_PASSWORD=my-password vprox edge 1.2.3.4 --routes 10.0.5.0/24
+
+# [Machine B: connect client]
+VPROX_PASSWORD=my-password vprox connect 1.2.3.4 --interface vprox0
+curl --interface vprox0 http://10.0.5.100:8080   # => reaches private resource
+```
+
+**Notes:**
+
+- The edge connector only requires **outbound** connectivity to the server (UDP port 50227 and TCP port 443). No inbound firewall rules are needed in the customer's VPC.
+- WireGuard's `PersistentKeepalive` (25s) keeps the NAT mapping alive for the outbound UDP tunnel.
+- Multiple edge connectors can connect to the same server as long as their advertised routes don't overlap.
+- The edge automatically reconnects if the tunnel goes unhealthy.
+- The `--routes` flag accepts multiple comma-separated CIDRs (e.g. `--routes 10.0.5.0/24,172.16.0.0/12`).
+
 ### Building
 
 To build `vprox`, run the following command with Go 1.22+ installed:
@@ -164,6 +234,7 @@ On AWS in particular, the `--cloud aws` option allows you to automatically disco
 - Optimized for throughput with automatic MTU, MSS, GSO/GRO, and multi-queue configuration
 - Connection tracking bypass (NOTRACK) for reduced CPU overhead on WireGuard UDP flows
 - OIDC authentication for passwordless auth from Modal containers (`oidc-modal`)
+- Edge connectors for accessing private VPC resources through the server (outbound-only, no inbound ports required)
 
 ## Authors
 
