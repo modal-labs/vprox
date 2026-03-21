@@ -52,6 +52,8 @@ var benchCmdArgs struct {
 	verify          bool
 	timeout         time.Duration
 	duration        time.Duration
+	plainHTTP       bool
+	udp             bool
 }
 
 func init() {
@@ -67,6 +69,10 @@ func init() {
 		5*time.Second, "HTTP timeout for each /connect request")
 	BenchCmd.Flags().DurationVar(&benchCmdArgs.duration, "duration",
 		0, "Run sustained load for this long (e.g. 60s, 5m). 0 means burst mode.")
+	BenchCmd.Flags().BoolVar(&benchCmdArgs.plainHTTP, "plain-http",
+		false, "Use plain HTTP instead of HTTPS (server must also use --plain-http)")
+	BenchCmd.Flags().BoolVar(&benchCmdArgs.udp, "udp",
+		false, "Use encrypted UDP registration instead of HTTPS (no TLS, single round-trip)")
 }
 
 func runBench(cmd *cobra.Command, args []string) error {
@@ -467,10 +473,29 @@ func sustainedWorker(
 	workerID int,
 	serverIp netip.Addr,
 	password string,
-	wgClient *wgctrl.Client,
+	_ *wgctrl.Client,
 	stats *sustainedStats,
 	globalIter *atomic.Int64,
 ) {
+	// Each worker gets its own persistent wgctrl.Client (netlink socket) so
+	// concurrent workers don't serialize on a shared mutex, but we avoid the
+	// overhead of creating/destroying a socket on every single cycle.
+	workerWgClient, err := wgctrl.New()
+	if err != nil {
+		log.Printf("[w%d] failed to create wgctrl client: %v", workerID, err)
+		return
+	}
+	defer workerWgClient.Close()
+
+	// Reuse a single HTTP client (and its TLS transport / connection pool)
+	// across all cycles in this worker, avoiding repeated TLS handshakes
+	// and transport allocations. The TLS session cache allows resumption
+	// so repeat connections to the same server skip the full handshake.
+	workerHttpClient := &http.Client{
+		Timeout: benchCmdArgs.timeout,
+		Transport: benchTransport(),
+	}
+
 	for iteration := 0; ; iteration++ {
 		// Check if we should stop.
 		select {
@@ -480,7 +505,7 @@ func sustainedWorker(
 		}
 
 		iter := globalIter.Add(1)
-		result := sustainedCycle(ctx, workerID, iteration, iter, serverIp, password, wgClient)
+		result := sustainedCycle(ctx, workerID, iteration, iter, serverIp, password, workerWgClient, workerHttpClient)
 		// Mark as cancelled only if the parent --duration context expired,
 		// NOT if a verify step timed out on its own.
 		if result.Error != nil && ctx.Err() != nil {
@@ -504,10 +529,10 @@ func sustainedWorker(
 }
 
 // sustainedCycle runs one full create → connect → verify → teardown cycle.
-// Each cycle creates its own wgctrl.Client so that verifyHandshake's Device()
-// calls and Connect's ConfigureDevice calls don't all serialize on one netlink
-// socket. With 1000 workers sharing a single client, the netlink mutex becomes
-// the bottleneck — not the server.
+// The caller (sustainedWorker) provides a persistent wgctrl.Client and
+// http.Client so we avoid the overhead of creating/destroying a netlink
+// socket and TLS transport on every cycle. Each worker has its own clients,
+// so concurrent workers don't serialize on a shared mutex.
 func sustainedCycle(
 	ctx context.Context,
 	workerID int,
@@ -515,7 +540,8 @@ func sustainedCycle(
 	globalIter int64,
 	serverIp netip.Addr,
 	password string,
-	_ *wgctrl.Client, // unused; each cycle creates its own
+	workerWgClient *wgctrl.Client,
+	workerHttpClient *http.Client,
 ) cycleResult {
 	cycleStart := time.Now()
 
@@ -527,16 +553,6 @@ func sustainedCycle(
 		Iteration: iteration,
 	}
 
-	// Each cycle gets its own wgctrl.Client (its own netlink socket) so
-	// concurrent workers don't serialize on a shared mutex.
-	cycleWgClient, err := wgctrl.New()
-	if err != nil {
-		result.Error = fmt.Errorf("wgctrl: %w", err)
-		result.TotalDuration = time.Since(cycleStart)
-		return result
-	}
-	defer cycleWgClient.Close()
-
 	key, err := lib.GetClientKey(ifname)
 	if err != nil {
 		result.Error = fmt.Errorf("key: %w", err)
@@ -545,17 +561,13 @@ func sustainedCycle(
 	}
 
 	client := &lib.Client{
-		Key:      key,
-		Ifname:   ifname,
-		ServerIp: serverIp,
-		Password: password,
-		WgClient: cycleWgClient,
-		Http: &http.Client{
-			Timeout: benchCmdArgs.timeout,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		},
+		Key:       key,
+		Ifname:    ifname,
+		ServerIp:  serverIp,
+		Password:  password,
+		WgClient:  workerWgClient,
+		Http:      workerHttpClient,
+		PlainHTTP: benchCmdArgs.plainHTTP,
 	}
 
 	// Create interface.
@@ -576,10 +588,16 @@ func sustainedCycle(
 	default:
 	}
 
-	// Connect.
+	// Connect via UDP or HTTP(S).
 	connectStart := time.Now()
-	if err := client.Connect(); err != nil {
-		result.Error = fmt.Errorf("connect: %w", err)
+	var connectErr error
+	if benchCmdArgs.udp {
+		connectErr = client.ConnectUDP()
+	} else {
+		connectErr = client.Connect()
+	}
+	if connectErr != nil {
+		result.Error = fmt.Errorf("connect: %w", connectErr)
 		result.ConnectDuration = time.Since(connectStart)
 		result.TotalDuration = time.Since(cycleStart)
 		return result
@@ -615,6 +633,32 @@ func sustainedCycle(
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+// benchTransport returns an *http.Transport configured for the current bench
+// flags. When --plain-http is set, TLS is disabled entirely and the scheme
+// switching happens in lib.Client (via PlainHTTP field). Otherwise a TLS
+// transport with session caching and InsecureSkipVerify is used.
+func benchTransport() *http.Transport {
+	if benchCmdArgs.plainHTTP {
+		return &http.Transport{
+			MaxIdleConns:        2,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     30 * time.Second,
+			DisableCompression:  true,
+		}
+	}
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			ClientSessionCache: tls.NewLRUClientSessionCache(4),
+		},
+		MaxIdleConns:        2,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     30 * time.Second,
+		DisableCompression:  true,
+		ForceAttemptHTTP2:   false,
+	}
+}
 
 // benchPercentile returns the p-th percentile from a sorted slice of durations.
 func benchPercentile(sorted []time.Duration, p int) time.Duration {
@@ -658,16 +702,15 @@ func benchEstablishConnection(
 	}
 
 	client := &lib.Client{
-		Key:      key,
-		Ifname:   ifname,
-		ServerIp: serverIp,
-		Password: password,
-		WgClient: wgClient,
+		Key:       key,
+		Ifname:    ifname,
+		ServerIp:  serverIp,
+		Password:  password,
+		WgClient:  wgClient,
+		PlainHTTP: benchCmdArgs.plainHTTP,
 		Http: &http.Client{
 			Timeout: benchCmdArgs.timeout,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
+			Transport: benchTransport(),
 		},
 	}
 
@@ -689,7 +732,11 @@ func benchEstablishConnection(
 	}
 
 	connectStart := time.Now()
-	err = client.Connect()
+	if benchCmdArgs.udp {
+		err = client.ConnectUDP()
+	} else {
+		err = client.Connect()
+	}
 	result.ConnectDuration = time.Since(connectStart)
 
 	if err != nil {

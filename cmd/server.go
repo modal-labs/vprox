@@ -28,6 +28,7 @@ var serverCmdArgs struct {
 	wgBlock      string
 	wgBlockPerIp string
 	cloud        string
+	plainHTTP    bool
 }
 
 func init() {
@@ -39,6 +40,8 @@ func init() {
 		"", "WireGuard block size for each --ip flag, if multiple are provided")
 	ServerCmd.Flags().StringVar(&serverCmdArgs.cloud, "cloud",
 		"", "Cloud provider for IP metadata (watches for changes)")
+	ServerCmd.Flags().BoolVar(&serverCmdArgs.plainHTTP, "plain-http",
+		false, "Use plain HTTP instead of HTTPS for the control plane (no TLS overhead)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
@@ -102,6 +105,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		done()
 		return err
 	}
+	sm.PlainHTTP = serverCmdArgs.plainHTTP
 
 	defer sm.Wait()
 	defer done()

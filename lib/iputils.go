@@ -50,6 +50,8 @@ type IpAllocator struct {
 	mu        sync.Mutex // Protects the fields below
 	prefix    netip.Prefix
 	allocated map[netip.Addr]struct{}
+	freeList  []netip.Addr // Stack of freed addresses available for reuse
+	nextAddr  netip.Addr   // Next never-allocated address to hand out
 }
 
 // NewIpAllocator creates a new IpAllocator for the given prefix.
@@ -60,6 +62,7 @@ func NewIpAllocator(prefix netip.Prefix) *IpAllocator {
 	ipa := new(IpAllocator)
 	ipa.prefix = prefix.Masked()
 	ipa.allocated = make(map[netip.Addr]struct{})
+	ipa.nextAddr = ipa.prefix.Addr().Next()
 	return ipa
 }
 
@@ -74,16 +77,29 @@ func (ipa *IpAllocator) Allocate() netip.Addr {
 	ipa.mu.Lock()
 	defer ipa.mu.Unlock()
 
-	addr := ipa.prefix.Addr().Next()
-	for ipa.prefix.Contains(addr) && !addr.IsUnspecified() {
+	// First, try to reuse a freed address from the free list (O(1) pop).
+	for len(ipa.freeList) > 0 {
+		n := len(ipa.freeList) - 1
+		addr := ipa.freeList[n]
+		ipa.freeList = ipa.freeList[:n]
+		// Safety check: skip if somehow already allocated (dedup via map).
 		if _, ok := ipa.allocated[addr]; !ok {
 			ipa.allocated[addr] = struct{}{}
 			return addr
 		}
-		addr = addr.Next()
 	}
 
-	// Otherwise, return the zero address.
+	// Otherwise, advance nextAddr to find a never-allocated address.
+	for ipa.prefix.Contains(ipa.nextAddr) && !ipa.nextAddr.IsUnspecified() {
+		addr := ipa.nextAddr
+		ipa.nextAddr = ipa.nextAddr.Next()
+		if _, ok := ipa.allocated[addr]; !ok {
+			ipa.allocated[addr] = struct{}{}
+			return addr
+		}
+	}
+
+	// No addresses available — return the zero address.
 	if ipa.prefix.Addr().Is4() {
 		return netip.AddrFrom4([4]byte{})
 	} else {
@@ -98,6 +114,7 @@ func (ipa *IpAllocator) Free(addr netip.Addr) bool {
 
 	if _, ok := ipa.allocated[addr]; ok {
 		delete(ipa.allocated, addr)
+		ipa.freeList = append(ipa.freeList, addr)
 		return true
 	}
 	return false

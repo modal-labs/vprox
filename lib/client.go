@@ -12,19 +12,25 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"os/exec"
+	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	probing "github.com/prometheus-community/pro-bing"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
+
 const (
-	verifyPollInterval = 100 * time.Millisecond
-	verifyStepTimeout  = 10 * time.Second
+	verifyPollInitial = 20 * time.Millisecond
+	verifyPollMax     = 200 * time.Millisecond
+	verifyUpTimeout   = 5 * time.Second
+	verifyPingTimeout = 10 * time.Second
 )
 
 // ErrResourceExhausted is returned when the server has reached its maximum
@@ -50,6 +56,10 @@ type Client struct {
 
 	// Http is used to make connect requests to the server.
 	Http *http.Client
+
+	// PlainHTTP disables TLS for the control-plane connection. When true,
+	// the client uses http:// instead of https:// to reach the server.
+	PlainHTTP bool
 
 	// wgCidr is the current subnet assigned to the WireGuard interface, if any.
 	wgCidr netip.Prefix
@@ -126,7 +136,11 @@ func (c *Client) updateInterface(resp connectResponse) error {
 
 // sendConnectionRequest attempts to send a connection request to the peer
 func (c *Client) sendConnectionRequest() (connectResponse, error) {
-	connectUrl, err := url.Parse(fmt.Sprintf("https://%s/connect", c.ServerIp))
+	scheme := "https"
+	if c.PlainHTTP {
+		scheme = "http"
+	}
+	connectUrl, err := url.Parse(fmt.Sprintf("%s://%s:443/connect", scheme, c.ServerIp))
 	if err != nil {
 		return connectResponse{}, fmt.Errorf("failed to parse connect URL: %v", err)
 	}
@@ -236,28 +250,25 @@ func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Contex
 	return stats.PacketsRecv > 0
 }
 
-// VerifyInterface mirrors the Rust verify_interface() check: it polls for the
-// interface to be UP with an IPv4 address, then waits for a WireGuard
-// handshake, then pings the server's tunnel address. Each step retries for up
-// to verifyStepTimeout (10 s) with verifyPollInterval (100 ms) between attempts.
+// VerifyInterface checks the WireGuard interface is functional: UP with an
+// IPv4 address and able to ping the server's tunnel endpoint. A successful
+// ping implies the handshake completed, so we skip the separate handshake
+// polling step (which required expensive Device() netlink calls that
+// serialise under contention with 1000+ workers). Retries use exponential
+// backoff to reduce contention on kernel resources.
 func (c *Client) VerifyInterface(ctx context.Context) error {
-	// Step 1: interface UP with an IPv4 address
-	if err := waitFor(ctx, verifyStepTimeout, verifyPollInterval, func() error {
+	// Step 1: interface UP with an IPv4 address (fast, local check)
+	if err := waitForBackoff(ctx, verifyUpTimeout, verifyPollInitial, verifyPollMax, func() error {
 		return c.verifyInterfaceUp()
 	}); err != nil {
 		return fmt.Errorf("wireguard interface %s failed to come up: %w", c.Ifname, err)
 	}
 
-	// Step 2: WireGuard handshake completed
-	if err := waitFor(ctx, verifyStepTimeout, verifyPollInterval, func() error {
-		return c.verifyHandshake()
-	}); err != nil {
-		return fmt.Errorf("wireguard interface %s failed to handshake: %w", c.Ifname, err)
-	}
-
-	// Step 3: ping the server's tunnel address (first usable IP in the subnet)
+	// Step 2: ping the server's tunnel address. A successful ping proves
+	// the handshake completed AND the tunnel is functional, so we don't
+	// need a separate verifyHandshake step.
 	peerAddr := c.wgCidr.Masked().Addr().Next()
-	if err := waitFor(ctx, verifyStepTimeout, verifyPollInterval, func() error {
+	if err := waitForBackoff(ctx, verifyPingTimeout, verifyPollInitial, verifyPollMax, func() error {
 		return c.verifyPing(peerAddr)
 	}); err != nil {
 		return fmt.Errorf("wireguard interface %s failed connectivity ping to %v: %w",
@@ -270,7 +281,14 @@ func (c *Client) VerifyInterface(ctx context.Context) error {
 // verifyInterfaceUp checks that the WireGuard interface is in the UP state and
 // has an IPv4 address assigned.
 func (c *Client) verifyInterfaceUp() error {
-	link, err := netlink.LinkByName(c.Ifname)
+	var link netlink.Link
+	var err error
+	for retries := 0; retries < 3; retries++ {
+		link, err = netlink.LinkByName(c.Ifname)
+		if err == nil || !errors.Is(err, syscall.EINTR) {
+			break
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("interface not found: %w", err)
 	}
@@ -278,7 +296,13 @@ func (c *Client) verifyInterfaceUp() error {
 		return fmt.Errorf("interface %s is not UP (state=%v)", c.Ifname, link.Attrs().OperState)
 	}
 
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	var addrs []netlink.Addr
+	for retries := 0; retries < 3; retries++ {
+		addrs, err = netlink.AddrList(link, netlink.FAMILY_V4)
+		if err == nil || !errors.Is(err, syscall.EINTR) {
+			break
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("failed to list addresses: %w", err)
 	}
@@ -288,48 +312,90 @@ func (c *Client) verifyInterfaceUp() error {
 	return nil
 }
 
-// verifyHandshake checks that the WireGuard device has completed a handshake
-// with at least one peer (i.e. LastHandshakeTime is non-zero).
-func (c *Client) verifyHandshake() error {
-	dev, err := c.WgClient.Device(c.Ifname)
-	if err != nil {
-		return fmt.Errorf("failed to get wireguard device: %w", err)
-	}
-	for _, peer := range dev.Peers {
-		if !peer.LastHandshakeTime.IsZero() {
-			return nil
-		}
-	}
-	return fmt.Errorf("no completed handshake on interface %s", c.Ifname)
-}
-
-// verifyPing sends 3 ICMP pings to the given address through the WireGuard
-// interface and returns an error if none are received.
-// verifyPing shells out to `ping -I <interface>` to verify connectivity,
-// matching the Rust verify_ping implementation. Using -I binds the socket to
-// the correct WireGuard interface, which is necessary when multiple interfaces
-// all have AllowedIPs 0.0.0.0/0 and would otherwise fight over the routing
-// table.
+// verifyPing sends a single ICMP echo request to the given address using a
+// raw socket bound to the WireGuard interface via SO_BINDTODEVICE. This is
+// essential when multiple WireGuard interfaces all have AllowedIPs 0.0.0.0/0.
+//
+// Uses direct syscalls instead of the probing library to avoid the overhead
+// of creating and tearing down pinger objects (DNS resolution, goroutines,
+// internal timers) on every attempt — critical when 1000+ workers are
+// polling concurrently. Each call opens a socket, sends one packet, waits
+// up to 300ms for a reply, and closes the socket.
 func (c *Client) verifyPing(addr netip.Addr) error {
-	cmd := exec.Command("ping",
-		"-c", "3",
-		"-W", "5",
-		"-i", "0.1",
-		"-q",
-		"-I", c.Ifname,
-		addr.String(),
-	)
-	output, err := cmd.CombinedOutput()
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
 	if err != nil {
-		return fmt.Errorf("ping to %v via %s failed: %s", addr, c.Ifname, strings.TrimSpace(string(output)))
+		return fmt.Errorf("ping %v via %s: socket: %w", addr, c.Ifname, err)
 	}
+	defer syscall.Close(fd)
+
+	// Bind to the WireGuard interface so the kernel routes the packet
+	// through the correct tunnel.
+	if err := syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.Ifname); err != nil {
+		return fmt.Errorf("ping %v via %s: bind: %w", addr, c.Ifname, err)
+	}
+
+	// Short receive timeout — we're already inside a retry loop with backoff.
+	tv := syscall.Timeval{Sec: 0, Usec: 300000} // 300ms
+	_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
+
+	// Build ICMP echo request using x/net/icmp for correct marshalling.
+	msg := icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Code: 0,
+		Body: &icmp.Echo{
+			ID:   os.Getpid() & 0xffff,
+			Seq:  1,
+			Data: []byte("vprox"),
+		},
+	}
+	wb, err := msg.Marshal(nil)
+	if err != nil {
+		return fmt.Errorf("ping %v: marshal: %w", addr, err)
+	}
+
+	// Send echo request.
+	dst := syscall.SockaddrInet4{}
+	dst.Addr = addr.As4()
+	if err := syscall.Sendto(fd, wb, 0, &dst); err != nil {
+		return fmt.Errorf("ping %v via %s: send: %w", addr, c.Ifname, err)
+	}
+
+	// Read reply. Raw ICMP sockets include the IP header in received data.
+	rb := make([]byte, 1500)
+	n, _, err := syscall.Recvfrom(fd, rb, 0)
+	if err != nil {
+		return fmt.Errorf("ping %v via %s: no reply: %w", addr, c.Ifname, err)
+	}
+
+	// Skip IP header (IHL field × 4 bytes) to get at the ICMP payload.
+	if n < 20 {
+		return fmt.Errorf("ping %v via %s: response too short (%d bytes)", addr, c.Ifname, n)
+	}
+	ihl := int(rb[0]&0x0f) * 4
+	if n < ihl+8 {
+		return fmt.Errorf("ping %v via %s: response too short for ICMP", addr, c.Ifname)
+	}
+
+	// Protocol number 1 = ICMPv4.
+	rm, err := icmp.ParseMessage(1, rb[ihl:n])
+	if err != nil {
+		return fmt.Errorf("ping %v via %s: parse: %w", addr, c.Ifname, err)
+	}
+	if rm.Type != ipv4.ICMPTypeEchoReply {
+		return fmt.Errorf("ping %v via %s: got %v, want echo reply", addr, c.Ifname, rm.Type)
+	}
+
 	return nil
 }
 
-// waitFor retries check until it succeeds, the timeout expires, or ctx is
-// cancelled. It mirrors the Rust wait_for helper.
-func waitFor(ctx context.Context, timeout, interval time.Duration, check func() error) error {
+// waitForBackoff retries check with exponential backoff (from initInterval up
+// to maxInterval) until it succeeds, the timeout expires, or ctx is cancelled.
+// Exponential backoff drastically reduces contention on kernel resources
+// (netlink sockets, WireGuard handshake processing) when many workers poll
+// concurrently.
+func waitForBackoff(ctx context.Context, timeout, initInterval, maxInterval time.Duration, check func() error) error {
 	deadline := time.Now().Add(timeout)
+	interval := initInterval
 	var lastErr error
 	for time.Now().Before(deadline) {
 		select {
@@ -345,6 +411,11 @@ func waitFor(ctx context.Context, timeout, interval time.Duration, check func() 
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(interval):
+		}
+		// Exponential backoff: double the interval up to the max.
+		interval = interval * 2
+		if interval > maxInterval {
+			interval = maxInterval
 		}
 	}
 	return fmt.Errorf("timed out after %v: %w", timeout, lastErr)

@@ -30,6 +30,7 @@ type ServerManager struct {
 	wgBlock       netip.Prefix
 	wgBlockPerIp  uint
 	activeServers map[netip.Addr]ServerInfo
+	PlainHTTP     bool
 
 	// freeIndices and nextFreeIndex together track usage of the range 0..numWgBlocks
 	freeIndices   []uint16 // stack of indices that are free
@@ -104,14 +105,15 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 	wgCidr := netip.PrefixFrom(subnetStart.Next(), int(sm.wgBlockPerIp))
 
 	srv := &Server{
-		Key:      sm.key,
-		BindAddr: ip,
-		Password: sm.password,
-		Index:    i,
-		Ipt:      sm.ipt,
-		WgClient: sm.wgClient,
-		WgCidr:   wgCidr,
-		Ctx:      subctx,
+		Key:       sm.key,
+		BindAddr:  ip,
+		Password:  sm.password,
+		Index:     i,
+		Ipt:       sm.ipt,
+		WgClient:  sm.wgClient,
+		WgCidr:    wgCidr,
+		Ctx:       subctx,
+		PlainHTTP: sm.PlainHTTP,
 	}
 	if err := srv.InitState(); err != nil {
 		_ = cancel // cancel should be discarded
