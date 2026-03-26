@@ -203,7 +203,7 @@ func (srv *Server) peerConfigFlusher() {
 		}
 
 		batch := []pendingPeer{first}
-		deadline := time.After(50 * time.Millisecond)
+		deadline := time.After(800 * time.Millisecond)
 
 	collect:
 		for len(batch) < 100 {
