@@ -103,6 +103,13 @@ func (ipa *IpAllocator) Free(addr netip.Addr) bool {
 	return false
 }
 
+// AllocatedCount returns the number of currently allocated IP addresses.
+func (ipa *IpAllocator) AllocatedCount() int {
+	ipa.mu.Lock()
+	defer ipa.mu.Unlock()
+	return len(ipa.allocated)
+}
+
 // MarkAllocated marks the given IP as allocated without going through the normal
 // allocation sequence. Used for takeover mode to mark IPs that are already in use
 // by existing WireGuard peers.

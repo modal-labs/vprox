@@ -16,6 +16,8 @@ require (
 )
 
 require (
+	github.com/DataDog/datadog-go/v5 v5.8.3 // indirect
+	github.com/Microsoft/go-winio v0.5.0 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.30.4 // indirect
 	github.com/aws/smithy-go v1.20.4 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
