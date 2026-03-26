@@ -190,6 +190,15 @@ type connectResponse struct {
 	ServerListenPort int
 }
 
+// configurePeerViaFlusher submits a peer config through the batch channel and
+// waits for the flusher to apply it. This ensures all ConfigureDevice calls go
+// through a single goroutine, avoiding netlink contention.
+func (srv *Server) configurePeerViaFlusher(config wgtypes.PeerConfig) error {
+	resultCh := make(chan error, 1)
+	srv.peerBatchCh <- pendingPeer{config: config, resultCh: resultCh}
+	return <-resultCh
+}
+
 // peerConfigFlusher batches concurrent WireGuard peer additions into single
 // ConfigureDevice calls to avoid serialized netlink overhead under load.
 func (srv *Server) peerConfigFlusher() {
@@ -671,15 +680,11 @@ func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
 	delete(srv.allPeers, publicKey)
 	srv.mu.Unlock()
 
-	// Remove the peer from WireGuard (no lock held during WireGuard operations).
+	// Remove the peer from WireGuard via the flusher to avoid netlink contention.
 	log.Printf("[%v] removing peer at %v: %v", srv.BindAddr, peerIp, publicKey)
-	err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
-		Peers: []wgtypes.PeerConfig{
-			{
-				PublicKey: publicKey,
-				Remove:    true,
-			},
-		},
+	err := srv.configurePeerViaFlusher(wgtypes.PeerConfig{
+		PublicKey: publicKey,
+		Remove:    true,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to remove WireGuard peer: %v", err)
@@ -739,9 +744,16 @@ func (srv *Server) removeIdlePeers() error {
 	srv.mu.Unlock()
 
 	if len(removePeers) > 0 {
-		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removePeers})
-		if err != nil {
-			return err
+		// Submit all removals through the flusher to avoid netlink contention.
+		resultChs := make([]chan error, len(removePeers))
+		for i, pc := range removePeers {
+			resultChs[i] = make(chan error, 1)
+			srv.peerBatchCh <- pendingPeer{config: pc, resultCh: resultChs[i]}
+		}
+		for _, ch := range resultChs {
+			if err := <-ch; err != nil {
+				return err
+			}
 		}
 		for _, ip := range removeIps {
 			srv.ipAllocator.Free(ip)
