@@ -34,9 +34,10 @@ func MetricsIncr(name string, tags ...string) {
 	}
 }
 
+// MetricsTiming sends a timing metric in milliseconds.
 func MetricsTiming(name string, d time.Duration, tags ...string) {
 	if metrics != nil {
-		metrics.Timing(name, d, tags, 1)
+		metrics.Distribution(name, float64(d.Microseconds())/1000.0, tags, 1)
 	}
 }
 
