@@ -2,7 +2,6 @@ package lib
 
 import (
 	"log"
-	"os"
 	"time"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
@@ -17,11 +16,9 @@ var metrics *statsd.Client
 // CPU and network bandwidth metrics are expected to come from the host-level
 // Vector/DD agent (host_metrics source), not from this process.
 func InitMetrics() {
-	hostname, _ := os.Hostname()
 	var err error
 	metrics, err = statsd.New("127.0.0.1:8125",
 		statsd.WithNamespace("modal.vprox."),
-		statsd.WithTags([]string{"node:" + hostname}),
 	)
 	if err != nil {
 		log.Printf("failed to init statsd client: %v (metrics disabled)", err)
