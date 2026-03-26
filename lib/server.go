@@ -206,7 +206,7 @@ func (srv *Server) peerConfigFlusher() {
 		deadline := time.After(800 * time.Millisecond)
 
 	collect:
-		for len(batch) < 100 {
+		for {
 			select {
 			case p := <-srv.peerBatchCh:
 				batch = append(batch, p)
@@ -699,9 +699,8 @@ func (srv *Server) removeIdlePeers() error {
 		return fmt.Errorf("failed to get WireGuard device: %v", err)
 	}
 
-	// Hold the lock for access to allPeers.
+	// Hold the lock only while reading allPeers; release before ConfigureDevice.
 	srv.mu.Lock()
-	defer srv.mu.Unlock()
 
 	var removePeers []wgtypes.PeerConfig
 	var removeIps []netip.Addr
@@ -736,6 +735,8 @@ func (srv *Server) removeIdlePeers() error {
 			delete(srv.allPeers, peer.PublicKey)
 		}
 	}
+
+	srv.mu.Unlock()
 
 	if len(removePeers) > 0 {
 		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removePeers})
