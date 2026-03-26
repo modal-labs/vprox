@@ -602,8 +602,9 @@ func (srv *Server) removeIdlePeersLoop() {
 
 		// Emit gauge metrics.
 		srv.mu.Lock()
-		MetricsGauge("active_peers", float64(len(srv.allPeers)))
+		activePeers := len(srv.allPeers)
 		srv.mu.Unlock()
+		MetricsGauge("active_peers", float64(activePeers))
 		MetricsGauge("allocated_ips", float64(srv.ipAllocator.AllocatedCount()))
 
 		if err := srv.removeIdlePeers(); err != nil {
