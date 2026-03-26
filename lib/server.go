@@ -187,7 +187,7 @@ type connectResponse struct {
 func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	t0 := time.Now()
 	MetricsIncr("connect.count")
-	defer func() { MetricsTiming("connect.latency", time.Since(t0)) }()
+	defer func() { MetricsTiming("connect.server_side_latency_ms", time.Since(t0)) }()
 
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -256,7 +256,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	})
-	MetricsTiming("wg_configure.latency", time.Since(tWg), "operation:add_peer")
+	MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:add_peer")
 	if err != nil {
 		srv.mu.Lock()
 		delete(srv.allPeers, peerKey)
@@ -297,7 +297,7 @@ type disconnectResponse struct {
 func (srv *Server) disconnectHandler(w http.ResponseWriter, r *http.Request) {
 	t0 := time.Now()
 	MetricsIncr("disconnect.count")
-	defer func() { MetricsTiming("disconnect.latency", time.Since(t0)) }()
+	defer func() { MetricsTiming("disconnect.server_side_latency_ms", time.Since(t0)) }()
 
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -465,7 +465,7 @@ func (srv *Server) StartWireguard() error {
 		PrivateKey: &srv.Key,
 		ListenPort: &listenPort,
 	})
-	MetricsTiming("wg_configure.latency", time.Since(tWg), "operation:init")
+	MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:init")
 	if err != nil {
 		if createdFreshInterface {
 			netlink.LinkDel(link)
@@ -642,7 +642,7 @@ func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
 			},
 		},
 	})
-	MetricsTiming("wg_configure.latency", time.Since(tWg), "operation:remove_peer")
+	MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:remove_peer")
 	if err != nil {
 		return fmt.Errorf("failed to remove WireGuard peer: %v", err)
 	}
@@ -702,7 +702,7 @@ func (srv *Server) removeIdlePeers() error {
 	if len(removePeers) > 0 {
 		tWg := time.Now()
 		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removePeers})
-		MetricsTiming("wg_configure.latency", time.Since(tWg), "operation:remove_idle_peers")
+		MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:remove_idle_peers")
 		if err != nil {
 			return err
 		}
