@@ -2,44 +2,88 @@ package lib
 
 import (
 	"log"
+	"net/http"
+	"strings"
 	"time"
 
-	"github.com/DataDog/datadog-go/v5/statsd"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-var metrics *statsd.Client
+var (
+	connectCount = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "modal_vprox_connect_count",
+	})
+	disconnectCount = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "modal_vprox_disconnect_count",
+	})
+	connectLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "modal_vprox_connect_server_side_latency_ms",
+		Buckets: []float64{1, 5, 10, 50, 100, 500, 1000, 5000, 10000},
+	})
+	disconnectLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "modal_vprox_disconnect_server_side_latency_ms",
+		Buckets: []float64{1, 5, 10, 50, 100, 500, 1000, 5000},
+	})
+	wgConfigureLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "modal_vprox_wg_configure_latency_ms",
+		Buckets: []float64{0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000},
+	}, []string{"operation"})
+	activePeersGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "modal_vprox_active_peers",
+	})
+	allocatedIpsGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "modal_vprox_allocated_ips",
+	})
+)
 
-// InitMetrics initializes the DogStatsD client. Metrics are sent via UDP to
-// localhost:8125 where a Vector/DD agent picks them up. If the agent isn't
-// running, UDP sends silently fail — no impact on the server.
-//
-// CPU and network bandwidth metrics are expected to come from the host-level
-// Vector/DD agent (host_metrics source), not from this process.
-func InitMetrics() {
-	var err error
-	metrics, err = statsd.New("127.0.0.1:8125",
-		statsd.WithNamespace("modal.vprox."),
-	)
-	if err != nil {
-		log.Printf("failed to init statsd client: %v (metrics disabled)", err)
-	}
+// StartMetricsServer starts an HTTP server on :9090 serving Prometheus metrics.
+// CPU and network bandwidth metrics are expected from the host-level Vector/DD agent.
+func StartMetricsServer() {
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		log.Printf("metrics server listening on :9090")
+		if err := http.ListenAndServe(":9090", mux); err != nil {
+			log.Printf("metrics server failed: %v", err)
+		}
+	}()
 }
 
 func MetricsIncr(name string, tags ...string) {
-	if metrics != nil {
-		metrics.Incr(name, tags, 1)
+	switch name {
+	case "connect.count":
+		connectCount.Inc()
+	case "disconnect.count":
+		disconnectCount.Inc()
 	}
 }
 
-// MetricsTiming sends a timing metric in milliseconds.
+// MetricsTiming records a latency observation in milliseconds.
 func MetricsTiming(name string, d time.Duration, tags ...string) {
-	if metrics != nil {
-		metrics.Distribution(name, float64(d.Microseconds())/1000.0, tags, 1)
+	ms := float64(d.Microseconds()) / 1000.0
+	switch name {
+	case "connect.server_side_latency_ms":
+		connectLatency.Observe(ms)
+	case "disconnect.server_side_latency_ms":
+		disconnectLatency.Observe(ms)
+	case "wg_configure.latency_ms":
+		operation := "unknown"
+		for _, t := range tags {
+			if k, v, ok := strings.Cut(t, ":"); ok && k == "operation" {
+				operation = v
+			}
+		}
+		wgConfigureLatency.WithLabelValues(operation).Observe(ms)
 	}
 }
 
 func MetricsGauge(name string, value float64, tags ...string) {
-	if metrics != nil {
-		metrics.Gauge(name, value, tags, 1)
+	switch name {
+	case "active_peers":
+		activePeersGauge.Set(value)
+	case "allocated_ips":
+		allocatedIpsGauge.Set(value)
 	}
 }

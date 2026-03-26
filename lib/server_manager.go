@@ -58,7 +58,7 @@ func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Conte
 		color.New(color.Bold).Sprint("server public key:"),
 		key.PublicKey().String())
 
-	InitMetrics()
+	StartMetricsServer()
 
 	sm := new(ServerManager)
 	sm.wgClient = wgClient
