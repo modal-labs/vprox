@@ -295,7 +295,20 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		},
 		resultCh: resultCh,
 	}
-	err = <-resultCh
+
+	select {
+	case err = <-resultCh:
+		// Normal path — ConfigureDevice completed.
+	case <-r.Context().Done():
+		// Client disconnected. Roll back state; the flusher may still apply the
+		// WireGuard config, but removeIdlePeersLoop will clean up the orphaned peer.
+		srv.mu.Lock()
+		delete(srv.allPeers, peerKey)
+		srv.mu.Unlock()
+		srv.ipAllocator.Free(peerIp)
+		log.Printf("[%v] client disconnected before WireGuard config completed: %v", srv.BindAddr, peerKey)
+		return
+	}
 	if err != nil {
 		srv.mu.Lock()
 		delete(srv.allPeers, peerKey)
