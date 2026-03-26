@@ -13,28 +13,28 @@ import (
 
 var (
 	connectCount = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "modal_vprox_connect_count",
+		Name: "modal__vprox__connect__count",
 	})
 	disconnectCount = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "modal_vprox_disconnect_count",
+		Name: "modal__vprox__disconnect__count",
 	})
 	connectLatency = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "modal_vprox_connect_server_side_latency_ms",
-		Buckets: []float64{1, 5, 10, 50, 100, 500, 1000, 5000, 10000},
+		Name:    "modal__vprox__connect__server_side_latency_ms",
+		Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100, 500, 1000, 5000, 10000},
 	})
 	disconnectLatency = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "modal_vprox_disconnect_server_side_latency_ms",
-		Buckets: []float64{1, 5, 10, 50, 100, 500, 1000, 5000},
+		Name:    "modal__vprox__disconnect__server_side_latency_ms",
+		Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100, 500, 1000, 5000},
 	})
 	wgConfigureLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "modal_vprox_wg_configure_latency_ms",
-		Buckets: []float64{0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000},
+		Name:    "modal__vprox__wg_configure__latency_ms",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100, 500, 1000},
 	}, []string{"operation"})
 	activePeersGauge = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "modal_vprox_active_peers",
+		Name: "modal__vprox__active_peers",
 	})
 	allocatedIpsGauge = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "modal_vprox_allocated_ips",
+		Name: "modal__vprox__allocated_ips",
 	})
 )
 
