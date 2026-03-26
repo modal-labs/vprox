@@ -45,6 +45,11 @@ type PeerInfo struct {
 	PeerIp         netip.Addr
 }
 
+type pendingPeer struct {
+	config   wgtypes.PeerConfig
+	resultCh chan error
+}
+
 // Server handles state for one WireGuard network.
 //
 // The `vprox server` command should create one Server instance for each
@@ -80,7 +85,8 @@ type Server struct {
 	// Ctx is the shutdown context for the server.
 	Ctx context.Context
 
-	ipAllocator *IpAllocator
+	ipAllocator  *IpAllocator
+	peerBatchCh  chan pendingPeer
 
 	mu       sync.Mutex // Protects the fields below.
 	allPeers map[wgtypes.Key]PeerInfo
@@ -105,6 +111,7 @@ func (srv *Server) InitState() error {
 	}
 
 	srv.ipAllocator = NewIpAllocator(srv.WgCidr)
+	srv.peerBatchCh = make(chan pendingPeer, 4096)
 	// Reserve the first IP address for the server itself.
 	reservedIp := srv.ipAllocator.Allocate()
 	if reservedIp != srv.WgCidr.Addr() {
@@ -183,6 +190,43 @@ type connectResponse struct {
 	ServerListenPort int
 }
 
+// peerConfigFlusher batches concurrent WireGuard peer additions into single
+// ConfigureDevice calls to avoid serialized netlink overhead under load.
+func (srv *Server) peerConfigFlusher() {
+	for {
+		// Block until first peer arrives or context is cancelled.
+		var first pendingPeer
+		select {
+		case <-srv.Ctx.Done():
+			return
+		case first = <-srv.peerBatchCh:
+		}
+
+		batch := []pendingPeer{first}
+		deadline := time.After(50 * time.Millisecond)
+
+	collect:
+		for len(batch) < 100 {
+			select {
+			case p := <-srv.peerBatchCh:
+				batch = append(batch, p)
+			case <-deadline:
+				break collect
+			}
+		}
+
+		configs := make([]wgtypes.PeerConfig, len(batch))
+		for i, p := range batch {
+			configs[i] = p.config
+		}
+		log.Printf("[%v] configuring %d peers in batch", srv.BindAddr, len(batch))
+		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: configs})
+		for _, p := range batch {
+			p.resultCh <- err
+		}
+	}
+}
+
 // Handle a new connection.
 func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -242,15 +286,16 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
 	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
-	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
-		Peers: []wgtypes.PeerConfig{
-			{
-				PublicKey:         peerKey,
-				ReplaceAllowedIPs: true,
-				AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
-			},
+	resultCh := make(chan error, 1)
+	srv.peerBatchCh <- pendingPeer{
+		config: wgtypes.PeerConfig{
+			PublicKey:         peerKey,
+			ReplaceAllowedIPs: true,
+			AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
 		},
-	})
+		resultCh: resultCh,
+	}
+	err = <-resultCh
 	if err != nil {
 		srv.mu.Lock()
 		delete(srv.allPeers, peerKey)
@@ -719,6 +764,7 @@ func (srv *Server) ListenForHttps() error {
 	}
 
 	go srv.removeIdlePeersLoop()
+	go srv.peerConfigFlusher()
 
 	// Some bind addresses may not have been added to the network interface. If
 	// that is the case, we need to add it (transiently).
