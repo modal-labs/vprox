@@ -5,6 +5,7 @@ go 1.23.0
 toolchain go1.24.4
 
 require (
+	github.com/DataDog/datadog-go/v5 v5.8.3
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.12
 	github.com/coreos/go-iptables v0.8.0
 	github.com/fatih/color v1.17.0
@@ -16,7 +17,6 @@ require (
 )
 
 require (
-	github.com/DataDog/datadog-go/v5 v5.8.3 // indirect
 	github.com/Microsoft/go-winio v0.5.0 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.30.4 // indirect
 	github.com/aws/smithy-go v1.20.4 // indirect
