@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 
 	"github.com/vishvananda/netlink"
 )
@@ -47,9 +48,11 @@ func getDefaultInterface() (netlink.Link, error) {
 //
 // All operations on an IpAllocator are thread-safe.
 type IpAllocator struct {
-	mu        sync.Mutex // Protects the fields below
-	prefix    netip.Prefix
-	allocated map[netip.Addr]struct{}
+	mu             sync.Mutex // Protects the fields below
+	prefix         netip.Prefix
+	allocated      map[netip.Addr]struct{}
+	// allocatedCount equals len(allocated); allows lock-free reads for monitoring.
+	allocatedCount atomic.Int64
 }
 
 // NewIpAllocator creates a new IpAllocator for the given prefix.
@@ -78,6 +81,7 @@ func (ipa *IpAllocator) Allocate() netip.Addr {
 	for ipa.prefix.Contains(addr) && !addr.IsUnspecified() {
 		if _, ok := ipa.allocated[addr]; !ok {
 			ipa.allocated[addr] = struct{}{}
+			ipa.allocatedCount.Add(1)
 			return addr
 		}
 		addr = addr.Next()
@@ -98,9 +102,15 @@ func (ipa *IpAllocator) Free(addr netip.Addr) bool {
 
 	if _, ok := ipa.allocated[addr]; ok {
 		delete(ipa.allocated, addr)
+		ipa.allocatedCount.Add(-1)
 		return true
 	}
 	return false
+}
+
+// AllocatedCount returns the number of currently allocated IP addresses.
+func (ipa *IpAllocator) AllocatedCount() int {
+	return int(ipa.allocatedCount.Load())
 }
 
 // MarkAllocated marks the given IP as allocated without going through the normal
@@ -117,6 +127,7 @@ func (ipa *IpAllocator) MarkAllocated(addr netip.Addr) {
 		return // already allocated; do nothing
 	}
 	ipa.allocated[addr] = struct{}{}
+	ipa.allocatedCount.Add(1)
 }
 
 // AfterCountIpBlock returns the result of incrementing an IP address by N CIDR
