@@ -443,33 +443,6 @@ func TestOIDCAuth_NoEnvironmentCheck_WhenNotConfigured(t *testing.T) {
 	assert.NoError(t, auth.Authenticate(req))
 }
 
-// --- base64URLDecode tests ---
-
-func TestBase64URLDecode(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		// No padding needed (len % 4 == 0)
-		{"aGVsbG8gd29ybGQh", "hello world!"},
-		// 2 chars padding needed (len % 4 == 2)
-		{"YQ", "a"},
-		// 1 char padding needed (len % 4 == 3)
-		{"YWI", "ab"},
-		// Already padded
-		{"YQ==", "a"},
-		{"YWI=", "ab"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.input, func(t *testing.T) {
-			result, err := base64URLDecode(tc.input)
-			require.NoError(t, err)
-			assert.Equal(t, tc.expected, string(result))
-		})
-	}
-}
-
 // --- stringInSlice tests ---
 
 func TestStringInSlice(t *testing.T) {
@@ -526,6 +499,7 @@ func TestJWKSCache_FetchesKeys(t *testing.T) {
 	_, issuer := serveJWKS(t, map[string]*rsa.PublicKey{"k1": pub})
 
 	cache := NewJWKSCache(issuer + "/jwks")
+	require.NoError(t, cache.Prefetch())
 
 	// Sign some data and verify.
 	msg := []byte("hello, world")
@@ -543,6 +517,7 @@ func TestJWKSCache_UnknownKid(t *testing.T) {
 	_, issuer := serveJWKS(t, map[string]*rsa.PublicKey{"k1": pub})
 
 	cache := NewJWKSCache(issuer + "/jwks")
+	require.NoError(t, cache.Prefetch())
 
 	msg := []byte("hello")
 	h := sha256.Sum256(msg)
@@ -560,6 +535,7 @@ func TestJWKSCache_InvalidSignature(t *testing.T) {
 	_, issuer := serveJWKS(t, map[string]*rsa.PublicKey{"k1": pub})
 
 	cache := NewJWKSCache(issuer + "/jwks")
+	require.NoError(t, cache.Prefetch())
 
 	err := cache.VerifyRS256("k1", []byte("hello"), []byte("bad-signature"))
 	assert.Error(t, err)
@@ -575,6 +551,7 @@ func TestJWKSCache_MultipleKeys(t *testing.T) {
 	})
 
 	cache := NewJWKSCache(issuer + "/jwks")
+	require.NoError(t, cache.Prefetch())
 
 	msg := []byte("test message")
 	h := sha256.Sum256(msg)

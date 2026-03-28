@@ -66,10 +66,15 @@ func NewOIDCModalAuthenticator(config *OIDCConfig) (*Authenticator, error) {
 		return nil, fmt.Errorf("failed to discover JWKS URL from issuer %s: %v", config.IssuerURL, err)
 	}
 
+	jwks := NewJWKSCache(jwksURL)
+	if err := jwks.Prefetch(); err != nil {
+		return nil, fmt.Errorf("failed to prefetch JWKS from %s: %v", jwksURL, err)
+	}
+
 	return &Authenticator{
 		mode: AuthModeOIDCModal,
 		oidc: config,
-		jwks: NewJWKSCache(jwksURL),
+		jwks: jwks,
 	}, nil
 }
 
@@ -212,6 +217,7 @@ type JWKSCache struct {
 	mu         sync.RWMutex
 	keys       map[string]*rsa.PublicKey
 	lastFetch  time.Time
+	refreshing bool
 	httpClient *http.Client
 }
 
@@ -238,33 +244,50 @@ func (c *JWKSCache) VerifyRS256(kid string, message, signature []byte) error {
 	return verifyRS256Signature(key, message, signature)
 }
 
-// getKey returns the RSA public key for the given key ID, fetching from the
-// JWKS endpoint if necessary.
+// Prefetch synchronously fetches the JWKS keys from the remote endpoint.
+// Call this during initialization to populate the cache before serving requests.
+func (c *JWKSCache) Prefetch() error {
+	return c.refresh()
+}
+
+// getKey returns the RSA public key for the given key ID.
+// If the cache is stale, a background refresh is triggered but the stale key
+// is returned immediately.  If the key is not present at all, an error is
+// returned without blocking.
 func (c *JWKSCache) getKey(kid string) (*rsa.PublicKey, error) {
-	// Try to find the key in the cache first.
 	c.mu.RLock()
 	key, ok := c.keys[kid]
 	cacheValid := time.Since(c.lastFetch) < jwksCacheDuration
 	c.mu.RUnlock()
 
-	if ok && cacheValid {
-		return key, nil
+	if !cacheValid {
+		c.triggerBackgroundRefresh()
 	}
-
-	// If the key is not found or the cache is stale, refresh.
-	if err := c.refresh(); err != nil {
-		return nil, fmt.Errorf("failed to refresh JWKS: %v", err)
-	}
-
-	c.mu.RLock()
-	key, ok = c.keys[kid]
-	c.mu.RUnlock()
 
 	if !ok {
 		return nil, fmt.Errorf("key %q not found in JWKS", kid)
 	}
 
 	return key, nil
+}
+
+// triggerBackgroundRefresh starts a background goroutine to refresh the JWKS
+// cache, unless a refresh is already in progress.
+func (c *JWKSCache) triggerBackgroundRefresh() {
+	c.mu.Lock()
+	if c.refreshing {
+		c.mu.Unlock()
+		return
+	}
+	c.refreshing = true
+	c.mu.Unlock()
+
+	go func() {
+		c.refresh() // best-effort; errors are silently dropped
+		c.mu.Lock()
+		c.refreshing = false
+		c.mu.Unlock()
+	}()
 }
 
 // refresh fetches the JWKS from the remote endpoint and updates the cache.
