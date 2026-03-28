@@ -93,14 +93,14 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load server key: %v", err)
 	}
 
-	password, err := lib.GetVproxPassword()
+	auth, err := lib.GetAuthenticator()
 	if err != nil {
 		return err
 	}
 
 	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, password, serverCmdArgs.takeover)
+	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, auth, serverCmdArgs.takeover)
 	if err != nil {
 		done()
 		return err
