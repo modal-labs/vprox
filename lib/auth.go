@@ -209,9 +209,9 @@ type ModalOIDCClaims struct {
 }
 
 type jwtHeader struct {
-	Alg string `json:"alg"`
-	Kid string `json:"kid"`
-	Typ string `json:"typ"`
+	Alg string `json:"alg"` // Algorithm: the signing algorithm used (e.g. "RS256")
+	Kid string `json:"kid"` // Key ID: identifier for the key used to sign the token
+	Typ string `json:"typ"` // Type: the type of token (e.g., "JWT")
 }
 
 // --- JWKS Cache ---
