@@ -467,33 +467,6 @@ func TestOIDCAuth_NoEnvironmentCheck_WhenNotConfigured(t *testing.T) {
 	assert.NoError(t, auth.Authenticate(req))
 }
 
-// --- base64URLDecode tests ---
-
-func TestBase64URLDecode(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		// No padding needed (len % 4 == 0)
-		{"aGVsbG8gd29ybGQh", "hello world!"},
-		// 2 chars padding needed (len % 4 == 2)
-		{"YQ", "a"},
-		// 1 char padding needed (len % 4 == 3)
-		{"YWI", "ab"},
-		// Already padded
-		{"YQ==", "a"},
-		{"YWI=", "ab"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.input, func(t *testing.T) {
-			result, err := base64URLDecode(tc.input)
-			require.NoError(t, err)
-			assert.Equal(t, tc.expected, string(result))
-		})
-	}
-}
-
 // --- stringInSlice tests ---
 
 func TestStringInSlice(t *testing.T) {

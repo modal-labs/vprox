@@ -115,7 +115,7 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 	}
 
 	// Decode the header to get the key ID.
-	headerBytes, err := base64URLDecode(parts[0])
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
 		return fmt.Errorf("invalid JWT header encoding: %v", err)
 	}
@@ -130,7 +130,7 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 	}
 
 	// Decode the payload.
-	payloadBytes, err := base64URLDecode(parts[1])
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return fmt.Errorf("invalid JWT payload encoding: %v", err)
 	}
@@ -141,7 +141,7 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 	}
 
 	// Verify the signature using the JWKS.
-	sigBytes, err := base64URLDecode(parts[2])
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
 		return fmt.Errorf("invalid JWT signature encoding: %v", err)
 	}
@@ -380,12 +380,12 @@ func discoverJWKSURL(issuerURL string) (string, error) {
 
 // jwkToRSAPublicKey converts a JWK to an RSA public key.
 func jwkToRSAPublicKey(jwk jwkKey) (*rsa.PublicKey, error) {
-	nBytes, err := base64URLDecode(jwk.N)
+	nBytes, err := base64.RawURLEncoding.DecodeString(jwk.N)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode JWK modulus: %v", err)
 	}
 
-	eBytes, err := base64URLDecode(jwk.E)
+	eBytes, err := base64.RawURLEncoding.DecodeString(jwk.E)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode JWK exponent: %v", err)
 	}
@@ -408,18 +408,6 @@ func verifyRS256Signature(pubKey *rsa.PublicKey, message, signature []byte) erro
 	// RS256 = RSASSA-PKCS1-v1_5 using SHA-256
 	h := sha256.Sum256(message)
 	return rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, h[:], signature)
-}
-
-// base64URLDecode decodes a base64url-encoded string (with or without padding).
-func base64URLDecode(s string) ([]byte, error) {
-	// Add padding if needed.
-	switch len(s) % 4 {
-	case 2:
-		s += "=="
-	case 3:
-		s += "="
-	}
-	return base64.URLEncoding.DecodeString(s)
 }
 
 // --- Utility ---
