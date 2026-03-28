@@ -190,8 +190,8 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 // ModalOIDCClaims represents the claims in a Modal OIDC identity token.
 type ModalOIDCClaims struct {
 	// Standard OIDC claims
-	Sub string `json:"sub\` // Subject: unique identifier for the user/entity
-	Aud string `json:"aud\` // Audience: intended recipient of the token (e.g., client ID)
+	Sub string `json:"sub"` // Subject: unique identifier for the user/entity
+	Aud string `json:"aud"` // Audience: intended recipient of the token (e.g., client ID)
 	Exp int64  `json:"exp"` // Expiration Time: Unix timestamp after which the token is invalid
 	Iat int64  `json:"iat"` // Issued At: Unix timestamp when the token was issued
 	Iss string `json:"iss"` // Issuer: URL of the identity provider that issued the token
@@ -329,12 +329,12 @@ type jwksResponse struct {
 }
 
 type jwkKey struct {
-	Kty string `json:"kty"`
-	Use string `json:"use"`
-	Kid string `json:"kid"`
-	Alg string `json:"alg"`
-	N   string `json:"n"`
-	E   string `json:"e"`
+	Kty string `json:"kty"` // Key Type: the cryptographic algorithm family (e.g., "RSA")
+	Use string `json:"use"` // Public Key Use: intended use of the key (e.g., "sig" for signature)
+	Kid string `json:"kid"` // Key ID: unique identifier for the key
+	Alg string `json:"alg"` // Algorithm: the algorithm intended for use with the key (e.g., "RS256")
+	N   string `json:"n"`   // Modulus: the RSA modulus (base64url-encoded)
+	E   string `json:"e"`   // Exponent: the RSA public exponent (base64url-encoded)
 }
 
 // --- OIDC Discovery ---
