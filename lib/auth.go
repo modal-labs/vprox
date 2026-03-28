@@ -190,12 +190,12 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 // ModalOIDCClaims represents the claims in a Modal OIDC identity token.
 type ModalOIDCClaims struct {
 	// Standard OIDC claims
-	Sub string `json:"sub"`
-	Aud string `json:"aud"`
-	Exp int64  `json:"exp"`
-	Iat int64  `json:"iat"`
-	Iss string `json:"iss"`
-	Jti string `json:"jti"`
+	Sub string `json:"sub\` // Subject: unique identifier for the user/entity
+	Aud string `json:"aud\` // Audience: intended recipient of the token (e.g., client ID)
+	Exp int64  `json:"exp"` // Expiration Time: Unix timestamp after which the token is invalid
+	Iat int64  `json:"iat"` // Issued At: Unix timestamp when the token was issued
+	Iss string `json:"iss"` // Issuer: URL of the identity provider that issued the token
+	Jti string `json:"jti"` // JWT ID: unique identifier for the token (used to prevent replay attacks)
 
 	// Modal-specific claims
 	WorkspaceID     string `json:"workspace_id"`
