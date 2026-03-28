@@ -53,7 +53,7 @@ type Client struct {
 
 	// Token is the bearer token used to authenticate with the server.
 	// In password mode, this is the VPROX_PASSWORD value.
-	// In OIDC mode, this is the MODAL_IDENTITY_TOKEN value.
+	// In oidc-modal mode, this is the VPROX_OIDC_TOKEN value.
 	Token string
 
 	// WgClient is a shared client for interacting with the WireGuard kernel module.

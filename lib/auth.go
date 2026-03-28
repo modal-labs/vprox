@@ -20,25 +20,21 @@ import (
 type AuthMode string
 
 const (
-	AuthModePassword AuthMode = "password"
-	AuthModeOIDC     AuthMode = "oidc"
+	AuthModePassword  AuthMode = "password"
+	AuthModeOIDCModal AuthMode = "oidc-modal"
 )
 
 // OIDCConfig holds configuration for OIDC-based authentication.
 type OIDCConfig struct {
-	// IssuerURL is the OIDC issuer URL (e.g. "https://oidc.modal.com").
+	// IssuerURL is the Modal OIDC issuer URL (e.g. "https://oidc.modal.com").
 	IssuerURL string
 
 	// Audience is the expected "aud" claim in the token. If empty, audience is not checked.
 	Audience string
 
-	// AllowedWorkspaceIDs is a list of workspace IDs that are allowed to authenticate.
+	// AllowedWorkspaceIDs is a list of Modal workspace IDs that are allowed to authenticate.
 	// If empty, any workspace is allowed (only issuer/signature are checked).
 	AllowedWorkspaceIDs []string
-
-	// AllowedEnvironmentNames is a list of environment names that are allowed.
-	// If empty, any environment is allowed.
-	AllowedEnvironmentNames []string
 }
 
 // Authenticator provides request authentication for the vprox server.
@@ -57,8 +53,8 @@ func NewPasswordAuthenticator(password string) *Authenticator {
 	}
 }
 
-// NewOIDCAuthenticator creates an Authenticator that validates Modal OIDC tokens.
-func NewOIDCAuthenticator(config *OIDCConfig) (*Authenticator, error) {
+// NewOIDCModalAuthenticator creates an Authenticator that validates Modal OIDC tokens.
+func NewOIDCModalAuthenticator(config *OIDCConfig) (*Authenticator, error) {
 	if config.IssuerURL == "" {
 		return nil, errors.New("OIDC issuer URL is required")
 	}
@@ -71,7 +67,7 @@ func NewOIDCAuthenticator(config *OIDCConfig) (*Authenticator, error) {
 	}
 
 	return &Authenticator{
-		mode: AuthModeOIDC,
+		mode: AuthModeOIDCModal,
 		oidc: config,
 		jwks: NewJWKSCache(jwksURL),
 	}, nil
@@ -93,7 +89,7 @@ func (a *Authenticator) Authenticate(r *http.Request) error {
 		}
 		return nil
 
-	case AuthModeOIDC:
+	case AuthModeOIDCModal:
 		return a.verifyOIDCToken(token)
 
 	default:
@@ -135,7 +131,7 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 		return fmt.Errorf("invalid JWT payload encoding: %v", err)
 	}
 
-	var claims ModalOIDCClaims
+	var claims ModalClaims
 	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
 		return fmt.Errorf("invalid JWT payload: %v", err)
 	}
@@ -171,24 +167,18 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 		return fmt.Errorf("audience mismatch: got %q, expected %q", claims.Aud, a.oidc.Audience)
 	}
 
-	// Verify Modal-specific claims.
+	// Verify Modal workspace claim.
 	if len(a.oidc.AllowedWorkspaceIDs) > 0 {
 		if !stringInSlice(claims.WorkspaceID, a.oidc.AllowedWorkspaceIDs) {
 			return fmt.Errorf("workspace %q is not in the allowed list", claims.WorkspaceID)
 		}
 	}
 
-	if len(a.oidc.AllowedEnvironmentNames) > 0 {
-		if !stringInSlice(claims.EnvironmentName, a.oidc.AllowedEnvironmentNames) {
-			return fmt.Errorf("environment %q is not in the allowed list", claims.EnvironmentName)
-		}
-	}
-
 	return nil
 }
 
-// ModalOIDCClaims represents the claims in a Modal OIDC identity token.
-type ModalOIDCClaims struct {
+// ModalClaims represents the claims in a Modal OIDC identity token.
+type ModalClaims struct {
 	// Standard OIDC claims
 	Sub string `json:"sub"` // Subject: unique identifier for the user/entity
 	Aud string `json:"aud"` // Audience: intended recipient of the token (e.g., client ID)

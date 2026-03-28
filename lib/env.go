@@ -3,6 +3,7 @@ package lib
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 )
@@ -20,8 +21,8 @@ func GetVproxPassword() (string, error) {
 func GetAuthMode() AuthMode {
 	mode := os.Getenv("VPROX_AUTH_MODE")
 	switch strings.ToLower(mode) {
-	case "oidc":
-		return AuthModeOIDC
+	case "oidc-modal":
+		return AuthModeOIDCModal
 	case "password", "":
 		return AuthModePassword
 	default:
@@ -48,24 +49,23 @@ func GetOIDCAudience() string {
 
 // GetOIDCAllowedWorkspaceIDs returns the list of allowed Modal workspace IDs
 // from the VPROX_OIDC_ALLOWED_WORKSPACE_IDS environment variable (comma-separated).
-// If empty, any workspace is allowed.
+// If empty, any workspace is allowed. If set to "*", all workspaces are explicitly
+// allowed (returns nil) with a warning logged at startup.
 func GetOIDCAllowedWorkspaceIDs() []string {
-	return splitCSV(os.Getenv("VPROX_OIDC_ALLOWED_WORKSPACE_IDS"))
+	raw := os.Getenv("VPROX_OIDC_ALLOWED_WORKSPACE_IDS")
+	if strings.TrimSpace(raw) == "*" {
+		log.Println("WARNING: VPROX_OIDC_ALLOWED_WORKSPACE_IDS is set to '*', allowing ALL workspaces. This should only be used for testing!")
+		return nil
+	}
+	return splitCSV(raw)
 }
 
-// GetOIDCAllowedEnvironmentNames returns the list of allowed Modal environment
-// names from the VPROX_OIDC_ALLOWED_ENVIRONMENTS environment variable (comma-separated).
-// If empty, any environment is allowed.
-func GetOIDCAllowedEnvironmentNames() []string {
-	return splitCSV(os.Getenv("VPROX_OIDC_ALLOWED_ENVIRONMENTS"))
-}
-
-// GetOIDCToken returns the OIDC identity token from the MODAL_IDENTITY_TOKEN
-// environment variable. This is the token that Modal injects into containers.
+// GetOIDCToken returns the OIDC identity token from the VPROX_OIDC_TOKEN
+// environment variable.
 func GetOIDCToken() (string, error) {
-	token := os.Getenv("MODAL_IDENTITY_TOKEN")
+	token := os.Getenv("VPROX_OIDC_TOKEN")
 	if token == "" {
-		return "", errors.New("MODAL_IDENTITY_TOKEN environment variable is not set (are you running inside a Modal container?)")
+		return "", errors.New("VPROX_OIDC_TOKEN environment variable is not set")
 	}
 	return token, nil
 }
@@ -76,14 +76,13 @@ func GetAuthenticator() (*Authenticator, error) {
 	mode := GetAuthMode()
 
 	switch mode {
-	case AuthModeOIDC:
+	case AuthModeOIDCModal:
 		config := &OIDCConfig{
-			IssuerURL:               GetOIDCIssuerURL(),
-			Audience:                GetOIDCAudience(),
-			AllowedWorkspaceIDs:     GetOIDCAllowedWorkspaceIDs(),
-			AllowedEnvironmentNames: GetOIDCAllowedEnvironmentNames(),
+			IssuerURL:           GetOIDCIssuerURL(),
+			Audience:            GetOIDCAudience(),
+			AllowedWorkspaceIDs: GetOIDCAllowedWorkspaceIDs(),
 		}
-		auth, err := NewOIDCAuthenticator(config)
+		auth, err := NewOIDCModalAuthenticator(config)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize OIDC authenticator: %v", err)
 		}
@@ -107,7 +106,7 @@ func GetClientToken() (string, error) {
 	mode := GetAuthMode()
 
 	switch mode {
-	case AuthModeOIDC:
+	case AuthModeOIDCModal:
 		return GetOIDCToken()
 	case AuthModePassword:
 		return GetVproxPassword()
