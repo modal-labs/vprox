@@ -26,7 +26,67 @@ sudo sysctl -w net.ipv4.ip_forward=1
 sudo sysctl -w net.ipv4.conf.all.rp_filter=2
 ```
 
+### Performance Tuning (Optional)
+
+For maximum throughput, especially on high-bandwidth servers with many peers, apply these additional sysctl settings. Create a file `/etc/sysctl.d/99-vprox-performance.conf` or apply them temporarily:
+
+```bash
+# UDP/Socket Buffer Sizes (WireGuard uses UDP)
+# Increase max buffer sizes to 25MB for high-throughput scenarios
+sudo sysctl -w net.core.rmem_max=26214400
+sudo sysctl -w net.core.wmem_max=26214400
+sudo sysctl -w net.core.rmem_default=1048576
+sudo sysctl -w net.core.wmem_default=1048576
+
+# Network device backlog (for high packet rates)
+# Increase backlog to handle traffic bursts
+sudo sysctl -w net.core.netdev_max_backlog=50000
+sudo sysctl -w net.core.netdev_budget=600
+
+# TCP tuning (for traffic inside the tunnel)
+# Format: min default max
+sudo sysctl -w net.ipv4.tcp_rmem="4096 1048576 26214400"
+sudo sysctl -w net.ipv4.tcp_wmem="4096 1048576 26214400"
+
+# Use BBR congestion control (better than cubic for most scenarios)
+sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+
+# Enable TCP Fast Open for reduced latency on reconnects
+sudo sysctl -w net.ipv4.tcp_fastopen=3
+
+# Connection tracking limits (critical for NAT with many peers)
+# Increase max tracked connections to 1M
+sudo sysctl -w net.netfilter.nf_conntrack_max=1048576
+
+# Optional: Busy polling for lower latency (increases CPU usage)
+# sudo sysctl -w net.core.busy_poll=50
+# sudo sysctl -w net.core.busy_read=50
+```
+
+To make these settings persistent across reboots, add them to `/etc/sysctl.d/99-vprox-performance.conf` without the `sudo sysctl -w` prefix:
+
+```
+# /etc/sysctl.d/99-vprox-performance.conf
+net.core.rmem_max=26214400
+net.core.wmem_max=26214400
+net.core.rmem_default=1048576
+net.core.wmem_default=1048576
+net.core.netdev_max_backlog=50000
+net.core.netdev_budget=600
+net.ipv4.tcp_rmem=4096 1048576 26214400
+net.ipv4.tcp_wmem=4096 1048576 26214400
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.netfilter.nf_conntrack_max=1048576
+```
+
+Then apply with `sudo sysctl --system`.
+
 To set up `vprox`, you'll need the private IPv4 address of the server connected to an Internet gateway (use the `ip addr` command), as well as a block of IPs to allocate to the WireGuard subnet between server and client. This has no particular meaning and can be arbitrarily chosen to not overlap with other subnets.
+
+#### Password Authentication (default)
+
+The default authentication mode uses a shared password via the `VPROX_PASSWORD` environment variable:
 
 ```bash
 # [Machine A: public IP 1.2.3.4, private IP 172.31.64.125]
@@ -37,6 +97,39 @@ VPROX_PASSWORD=my-password vprox connect 1.2.3.4 --interface vprox0
 curl ifconfig.me                     # => 5.6.7.8
 curl --interface vprox0 ifconfig.me  # => 1.2.3.4
 ```
+
+#### OIDC Authentication (Modal)
+
+vprox supports OIDC token-based authentication, designed for use with [Modal's OIDC integration](https://modal.com/docs/guide/oidc-integration). In this mode, the server verifies JWT identity tokens signed by Modal instead of using a shared password.
+
+**Server setup:**
+
+```bash
+# Start the server in oidc-modal mode, restricting access to a specific Modal workspace
+VPROX_AUTH_MODE=oidc-modal \
+VPROX_OIDC_ISSUER=https://oidc.modal.com \
+VPROX_OIDC_ALLOWED_WORKSPACE_IDS=ws-abc123 \
+  vprox server --ip 172.31.64.125 --wg-block 240.1.0.0/16
+```
+
+**Client setup (inside a Modal container):**
+
+```bash
+# Modal sets MODAL_IDENTITY_TOKEN automatically; pass it to vprox via VPROX_OIDC_TOKEN
+VPROX_AUTH_MODE=oidc-modal \
+VPROX_OIDC_TOKEN="$MODAL_IDENTITY_TOKEN" \
+  vprox connect 1.2.3.4 --interface vprox0
+```
+
+**OIDC environment variables:**
+
+| Variable | Description | Default |
+|---|---|---|
+| `VPROX_AUTH_MODE` | Auth mode: `password` or `oidc-modal` | `password` |
+| `VPROX_OIDC_TOKEN` | OIDC identity token (JWT) for client authentication | — |
+| `VPROX_OIDC_ISSUER` | OIDC issuer URL | `https://oidc.modal.com` |
+| `VPROX_OIDC_AUDIENCE` | Expected `aud` claim (skip check if empty) | _(empty)_ |
+| `VPROX_OIDC_ALLOWED_WORKSPACE_IDS` | Comma-separated list of allowed Modal workspace IDs. Set to `*` to explicitly allow all workspaces (**testing only**). | _(any)_ |
 
 Note that Machine B must be able to send UDP packets to port 50227 on Machine A, and TCP to port 443.
 
@@ -68,6 +161,9 @@ On AWS in particular, the `--cloud aws` option allows you to automatically disco
 - Automatic discovery of IPs using instance metadata endpoints (AWS)
 - Only one vprox server may be running on a host
 - Control traffic is encrypted with TLS (Warning: does not verify server certificate)
+- Optimized for throughput with automatic MTU, MSS, GSO/GRO, and multi-queue configuration
+- Connection tracking bypass (NOTRACK) for reduced CPU overhead on WireGuard UDP flows
+- OIDC authentication for passwordless auth from Modal containers (`oidc-modal`)
 
 ## Authors
 
