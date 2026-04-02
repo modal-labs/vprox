@@ -194,6 +194,16 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject new connections while the server is shutting down for an upgrade.
+	srv.mu.Lock()
+	relinquished := srv.relinquished
+	srv.mu.Unlock()
+	if relinquished {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "server is upgrading", http.StatusServiceUnavailable)
+		return
+	}
+
 	if err := srv.Auth.Authenticate(r); err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -300,6 +310,17 @@ func (srv *Server) disconnectHandler(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Reject disconnects while the server is shutting down for an upgrade.
+	// The new server will inherit all peer state, so disconnects are not needed.
+	srv.mu.Lock()
+	relinquished := srv.relinquished
+	srv.mu.Unlock()
+	if relinquished {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "server is upgrading", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -782,7 +803,10 @@ func (srv *Server) ListenForHttps() error {
 	select {
 	case <-srv.Ctx.Done():
 		log.Printf("server no longer listening on %v:443\n", srv.BindAddr)
-		return httpServer.Shutdown(srv.Ctx)
+		// Use a fresh context for graceful drain; srv.Ctx is already cancelled.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		return httpServer.Shutdown(shutdownCtx)
 	case err = <-errCh:
 		return err
 	}

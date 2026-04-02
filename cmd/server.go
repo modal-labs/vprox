@@ -29,6 +29,7 @@ var serverCmdArgs struct {
 	wgBlockPerIp string
 	cloud        string
 	takeover     bool
+	controlPort  int
 }
 
 func init() {
@@ -42,6 +43,8 @@ func init() {
 		"", "Cloud provider for IP metadata (watches for changes)")
 	ServerCmd.Flags().BoolVar(&serverCmdArgs.takeover, "takeover",
 		false, "Take over existing WireGuard state from a previous server instance (for non-disruptive upgrades)")
+	ServerCmd.Flags().IntVar(&serverCmdArgs.controlPort, "control-port",
+		lib.DefaultControlPort, "Port for the upgrade control server (0 to disable)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
@@ -108,6 +111,17 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	defer done()
 	defer sm.Wait()
+
+	// Start the control server for upgrade orchestration.
+	if serverCmdArgs.controlPort > 0 {
+		cs := lib.NewControlServer(sm, auth, serverCmdArgs.controlPort, done)
+		cs.SetCloud(cloud)
+		go func() {
+			if err := cs.Start(ctx); err != nil {
+				fmt.Printf("control server error: %v\n", err)
+			}
+		}()
+	}
 
 	if cloud == "aws" {
 		initialIps, err := pollAws(lib.NewAwsMetadata(), make(ipSet), sm)

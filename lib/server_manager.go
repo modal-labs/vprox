@@ -16,6 +16,7 @@ import (
 type ServerInfo struct {
 	i      uint16
 	cancel context.CancelFunc
+	srv    *Server
 }
 
 // ServerManager handles creating and terminating servers on ips
@@ -150,7 +151,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		}
 	}()
 
-	sm.activeServers[ip] = ServerInfo{i, cancel}
+	sm.activeServers[ip] = ServerInfo{i, cancel, srv}
 	return nil
 }
 
@@ -167,4 +168,42 @@ func (sm *ServerManager) Stop(ip netip.Addr) {
 		return
 	}
 	server.cancel()
+}
+
+// RelinquishServer marks the server at the given IP as relinquished (preserving
+// WireGuard state on exit) and then cancels it so it shuts down gracefully.
+// This is used during upgrades so the new binary can take over the interfaces.
+func (sm *ServerManager) RelinquishServer(ip netip.Addr) {
+	server, ok := sm.activeServers[ip]
+	if !ok {
+		log.Printf("tried to relinquish, but no server started at %v", ip)
+		return
+	}
+
+	server.srv.mu.Lock()
+	server.srv.relinquished = true
+	server.srv.mu.Unlock()
+
+	log.Printf("[%v] server relinquished via control server — WireGuard state will be preserved", ip)
+
+	server.cancel()
+}
+
+// ActiveIPs returns the list of currently active server IP addresses.
+func (sm *ServerManager) ActiveIPs() []netip.Addr {
+	ips := make([]netip.Addr, 0, len(sm.activeServers))
+	for ip := range sm.activeServers {
+		ips = append(ips, ip)
+	}
+	return ips
+}
+
+// WgBlock returns the WireGuard CIDR block.
+func (sm *ServerManager) WgBlock() netip.Prefix {
+	return sm.wgBlock
+}
+
+// WgBlockPerIp returns the per-IP WireGuard block size.
+func (sm *ServerManager) WgBlockPerIp() uint {
+	return sm.wgBlockPerIp
 }
