@@ -193,6 +193,10 @@ type connectResponse struct {
 
 // Handle a new connection.
 func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
+	t0 := time.Now()
+	MetricsIncr("connect.count")
+	defer func() { MetricsTiming("connect.server_side_latency_ms", time.Since(t0)) }()
+
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -249,6 +253,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
 	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
+	tWg := time.Now()
 	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{
 			{
@@ -258,6 +263,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	})
+	MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:add_peer")
 	if err != nil {
 		srv.mu.Lock()
 		delete(srv.allPeers, peerKey)
@@ -296,6 +302,10 @@ type disconnectResponse struct {
 
 // Handle a disconnect request from a client.
 func (srv *Server) disconnectHandler(w http.ResponseWriter, r *http.Request) {
+	t0 := time.Now()
+	MetricsIncr("disconnect.count")
+	defer func() { MetricsTiming("disconnect.server_side_latency_ms", time.Since(t0)) }()
+
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -672,10 +682,12 @@ func (srv *Server) StartWireguard() error {
 	}
 
 	listenPort := WireguardListenPortBase + int(srv.Index)
+	tWg := time.Now()
 	err := srv.WgClient.ConfigureDevice(ifname, wgtypes.Config{
 		PrivateKey: &srv.Key,
 		ListenPort: &listenPort,
 	})
+	MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:init")
 	if err != nil {
 		if createdFreshInterface {
 			netlink.LinkDel(link)
@@ -811,6 +823,13 @@ func (srv *Server) removeIdlePeersLoop() {
 		case <-time.After(5 * time.Second):
 		}
 
+		// Emit gauge metrics.
+		srv.mu.Lock()
+		activePeers := len(srv.allPeers)
+		srv.mu.Unlock()
+		MetricsGauge("active_peers", float64(activePeers))
+		MetricsGauge("allocated_ips", float64(srv.ipAllocator.AllocatedCount()))
+
 		if err := srv.removeIdlePeers(); err != nil {
 			log.Printf("error removing idle peers: %v", err)
 		}
@@ -839,6 +858,7 @@ func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
 
 	// Remove the peer from WireGuard (no lock held during WireGuard operations).
 	log.Printf("[%v] removing peer at %v: %v", srv.BindAddr, peerIp, publicKey)
+	tWg := time.Now()
 	err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{
 			{
@@ -847,6 +867,7 @@ func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
 			},
 		},
 	})
+	MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:remove_peer")
 	if err != nil {
 		return fmt.Errorf("failed to remove WireGuard peer: %v", err)
 	}
@@ -909,7 +930,9 @@ func (srv *Server) removeIdlePeers() error {
 	}
 
 	if len(removePeers) > 0 {
+		tWg := time.Now()
 		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removePeers})
+		MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:remove_idle_peers")
 		if err != nil {
 			return err
 		}

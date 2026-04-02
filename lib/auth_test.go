@@ -431,6 +431,7 @@ func TestOIDCAuth_NoWorkspaceCheck_WhenNotConfigured(t *testing.T) {
 	assert.NoError(t, auth.Authenticate(req))
 }
 
+<<<<<<< HEAD
 // --- base64URLDecode tests ---
 
 func TestBase64URLDecode(t *testing.T) {
@@ -456,6 +457,18 @@ func TestBase64URLDecode(t *testing.T) {
 			assert.Equal(t, tc.expected, string(result))
 		})
 	}
+=======
+func TestOIDCAuth_NoEnvironmentCheck_WhenNotConfigured(t *testing.T) {
+	auth, issuer, priv := buildOIDCAuthenticator(t, nil)
+
+	claims := defaultClaims(issuer)
+	claims.EnvironmentName = "any-env"
+	token := signJWT(t, defaultHeader(), claims, priv)
+
+	req := httptest.NewRequest("GET", "/connect", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	assert.NoError(t, auth.Authenticate(req))
+>>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 }
 
 // --- stringInSlice tests ---
@@ -514,6 +527,10 @@ func TestJWKSCache_FetchesKeys(t *testing.T) {
 	_, issuer := serveJWKS(t, map[string]*rsa.PublicKey{"k1": pub})
 
 	cache := NewJWKSCache(issuer + "/jwks")
+<<<<<<< HEAD
+=======
+	require.NoError(t, cache.Prefetch())
+>>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 
 	// Sign some data and verify.
 	msg := []byte("hello, world")
@@ -531,6 +548,10 @@ func TestJWKSCache_UnknownKid(t *testing.T) {
 	_, issuer := serveJWKS(t, map[string]*rsa.PublicKey{"k1": pub})
 
 	cache := NewJWKSCache(issuer + "/jwks")
+<<<<<<< HEAD
+=======
+	require.NoError(t, cache.Prefetch())
+>>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 
 	msg := []byte("hello")
 	h := sha256.Sum256(msg)
@@ -548,6 +569,10 @@ func TestJWKSCache_InvalidSignature(t *testing.T) {
 	_, issuer := serveJWKS(t, map[string]*rsa.PublicKey{"k1": pub})
 
 	cache := NewJWKSCache(issuer + "/jwks")
+<<<<<<< HEAD
+=======
+	require.NoError(t, cache.Prefetch())
+>>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 
 	err := cache.VerifyRS256("k1", []byte("hello"), []byte("bad-signature"))
 	assert.Error(t, err)
@@ -563,6 +588,10 @@ func TestJWKSCache_MultipleKeys(t *testing.T) {
 	})
 
 	cache := NewJWKSCache(issuer + "/jwks")
+<<<<<<< HEAD
+=======
+	require.NoError(t, cache.Prefetch())
+>>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 
 	msg := []byte("test message")
 	h := sha256.Sum256(msg)
