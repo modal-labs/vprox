@@ -12,23 +12,22 @@ import (
 
 const DefaultControlPort = 9123
 
-// ControlServer runs a plain HTTP server on a separate port for upgrade orchestration.
+// ControlServer runs a plain HTTP server on localhost for upgrade orchestration.
 // It provides endpoints for the new binary to query state and trigger graceful shutdown.
+// It binds to 127.0.0.1 only and does not require authentication.
 type ControlServer struct {
 	sm       *ServerManager
-	auth     *Authenticator
 	port     int
 	cloud    string
 	server   *http.Server
 	cancelFn context.CancelFunc // cancels the top-level server context
 }
 
-// NewControlServer creates a control server bound to the given port.
+// NewControlServer creates a control server bound to the given port on localhost.
 // cancelFn should cancel the top-level context that governs the ServerManager lifecycle.
-func NewControlServer(sm *ServerManager, auth *Authenticator, port int, cancelFn context.CancelFunc) *ControlServer {
+func NewControlServer(sm *ServerManager, port int, cancelFn context.CancelFunc) *ControlServer {
 	return &ControlServer{
 		sm:       sm,
-		auth:     auth,
 		port:     port,
 		cancelFn: cancelFn,
 	}
@@ -56,8 +55,8 @@ func (cs *ControlServer) SetCloud(cloud string) {
 	cs.cloud = cloud
 }
 
-// Start begins listening for control requests. It blocks until the context is done
-// or an error occurs.
+// Start begins listening for control requests on localhost. It blocks until the
+// context is done or an error occurs.
 func (cs *ControlServer) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/info", cs.infoHandler)
@@ -67,12 +66,12 @@ func (cs *ControlServer) Start(ctx context.Context) error {
 		Handler: mux,
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", cs.port))
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cs.port))
 	if err != nil {
-		return fmt.Errorf("control server: failed to listen on :%d: %v", cs.port, err)
+		return fmt.Errorf("control server: failed to listen on 127.0.0.1:%d: %v", cs.port, err)
 	}
 
-	log.Printf("control server listening on :%d", cs.port)
+	log.Printf("control server listening on 127.0.0.1:%d", cs.port)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -98,11 +97,6 @@ func (cs *ControlServer) Start(ctx context.Context) error {
 func (cs *ControlServer) infoHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if err := cs.auth.Authenticate(r); err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -137,11 +131,6 @@ func (cs *ControlServer) infoHandler(w http.ResponseWriter, r *http.Request) {
 func (cs *ControlServer) shutdownHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if err := cs.auth.Authenticate(r); err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 

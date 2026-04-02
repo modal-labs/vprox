@@ -26,7 +26,7 @@ configuration, triggers a graceful shutdown (preserving WireGuard state),
 and then starts the current binary as the new server with --takeover.
 
 The old server must have been started with the control server enabled.
-Both the old and new binaries must share the same VPROX_PASSWORD or auth config.`,
+The control server listens on localhost only, so no authentication is required.`,
 	RunE: runUpgrade,
 }
 
@@ -62,11 +62,6 @@ type upgradeShutdownResponse struct {
 }
 
 func runUpgrade(cmd *cobra.Command, args []string) error {
-	token, err := lib.GetClientToken()
-	if err != nil {
-		return fmt.Errorf("failed to get auth token: %v", err)
-	}
-
 	controlBase := fmt.Sprintf("http://%s:%d", upgradeCmdArgs.controlAddr, upgradeCmdArgs.controlPort)
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
@@ -74,7 +69,7 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 	bold := color.New(color.Bold)
 	fmt.Printf("%s Connecting to control server at %s\n", bold.Sprint("==>"), controlBase)
 
-	info, err := getControlInfo(httpClient, controlBase, token)
+	info, err := getControlInfo(httpClient, controlBase)
 	if err != nil {
 		return fmt.Errorf("failed to get server info: %v", err)
 	}
@@ -88,7 +83,7 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 	// Step 2: Request graceful shutdown.
 	fmt.Printf("\n%s Requesting graceful shutdown (preserving WireGuard state)...\n", bold.Sprint("==>"))
 
-	shutdownResp, err := requestControlShutdown(httpClient, controlBase, token)
+	shutdownResp, err := requestControlShutdown(httpClient, controlBase)
 	if err != nil {
 		return fmt.Errorf("failed to request shutdown: %v", err)
 	}
@@ -112,12 +107,11 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 	return execNewServer(info)
 }
 
-func getControlInfo(client *http.Client, baseURL, token string) (*upgradeInfoResponse, error) {
+func getControlInfo(client *http.Client, baseURL string) (*upgradeInfoResponse, error) {
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/info", nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -143,12 +137,11 @@ func getControlInfo(client *http.Client, baseURL, token string) (*upgradeInfoRes
 	return &info, nil
 }
 
-func requestControlShutdown(client *http.Client, baseURL, token string) (*upgradeShutdownResponse, error) {
+func requestControlShutdown(client *http.Client, baseURL string) (*upgradeShutdownResponse, error) {
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/shutdown", nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -114,7 +114,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	// Start the control server for upgrade orchestration.
 	if serverCmdArgs.controlPort > 0 {
-		cs := lib.NewControlServer(sm, auth, serverCmdArgs.controlPort, done)
+		cs := lib.NewControlServer(sm, serverCmdArgs.controlPort, done)
 		cs.SetCloud(cloud)
 		go func() {
 			if err := cs.Start(ctx); err != nil {
