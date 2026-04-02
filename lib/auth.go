@@ -66,12 +66,6 @@ func NewOIDCModalAuthenticator(config *OIDCConfig) (*Authenticator, error) {
 		return nil, fmt.Errorf("failed to discover JWKS URL from issuer %s: %v", config.IssuerURL, err)
 	}
 
-<<<<<<< HEAD
-	return &Authenticator{
-		mode: AuthModeOIDCModal,
-		oidc: config,
-		jwks: NewJWKSCache(jwksURL),
-=======
 	jwks := NewJWKSCache(jwksURL)
 	if err := jwks.Prefetch(); err != nil {
 		return nil, fmt.Errorf("failed to prefetch JWKS from %s: %v", jwksURL, err)
@@ -81,7 +75,6 @@ func NewOIDCModalAuthenticator(config *OIDCConfig) (*Authenticator, error) {
 		mode: AuthModeOIDCModal,
 		oidc: config,
 		jwks: jwks,
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 	}, nil
 }
 
@@ -123,11 +116,7 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 	}
 
 	// Decode the header to get the key ID.
-<<<<<<< HEAD
 	headerBytes, err := base64URLDecode(parts[0])
-=======
-	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 	if err != nil {
 		return fmt.Errorf("invalid JWT header encoding: %v", err)
 	}
@@ -142,11 +131,7 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 	}
 
 	// Decode the payload.
-<<<<<<< HEAD
 	payloadBytes, err := base64URLDecode(parts[1])
-=======
-	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 	if err != nil {
 		return fmt.Errorf("invalid JWT payload encoding: %v", err)
 	}
@@ -157,11 +142,7 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 	}
 
 	// Verify the signature using the JWKS.
-<<<<<<< HEAD
 	sigBytes, err := base64URLDecode(parts[2])
-=======
-	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 	if err != nil {
 		return fmt.Errorf("invalid JWT signature encoding: %v", err)
 	}
@@ -204,21 +185,12 @@ func (a *Authenticator) verifyOIDCToken(tokenStr string) error {
 // ModalClaims represents the claims in a Modal OIDC identity token.
 type ModalClaims struct {
 	// Standard OIDC claims
-<<<<<<< HEAD
-	Sub string `json:"sub"`
-	Aud string `json:"aud"`
-	Exp int64  `json:"exp"`
-	Iat int64  `json:"iat"`
-	Iss string `json:"iss"`
-	Jti string `json:"jti"`
-=======
 	Sub string `json:"sub"` // Subject: unique identifier for the user/entity
 	Aud string `json:"aud"` // Audience: intended recipient of the token (e.g., client ID)
 	Exp int64  `json:"exp"` // Expiration Time: Unix timestamp after which the token is invalid
 	Iat int64  `json:"iat"` // Issued At: Unix timestamp when the token was issued
 	Iss string `json:"iss"` // Issuer: URL of the identity provider that issued the token
 	Jti string `json:"jti"` // JWT ID: unique identifier for the token (used to prevent replay attacks)
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 
 	// Modal-specific claims
 	WorkspaceID     string `json:"workspace_id"`
@@ -232,15 +204,9 @@ type ModalClaims struct {
 }
 
 type jwtHeader struct {
-<<<<<<< HEAD
-	Alg string `json:"alg"`
-	Kid string `json:"kid"`
-	Typ string `json:"typ"`
-=======
 	Alg string `json:"alg"` // Algorithm: the signing algorithm used (e.g. "RS256")
 	Kid string `json:"kid"` // Key ID: identifier for the key used to sign the token
 	Typ string `json:"typ"` // Type: the type of token (e.g., "JWT")
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 }
 
 // --- JWKS Cache ---
@@ -251,10 +217,7 @@ type JWKSCache struct {
 	mu         sync.RWMutex
 	keys       map[string]*rsa.PublicKey
 	lastFetch  time.Time
-<<<<<<< HEAD
-=======
 	refreshing bool
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 	httpClient *http.Client
 }
 
@@ -281,12 +244,6 @@ func (c *JWKSCache) VerifyRS256(kid string, message, signature []byte) error {
 	return verifyRS256Signature(key, message, signature)
 }
 
-<<<<<<< HEAD
-// getKey returns the RSA public key for the given key ID, fetching from the
-// JWKS endpoint if necessary.
-func (c *JWKSCache) getKey(kid string) (*rsa.PublicKey, error) {
-	// Try to find the key in the cache first.
-=======
 // Prefetch synchronously fetches the JWKS keys from the remote endpoint.
 // Call this during initialization to populate the cache before serving requests.
 func (c *JWKSCache) Prefetch() error {
@@ -298,32 +255,15 @@ func (c *JWKSCache) Prefetch() error {
 // is returned immediately.  If the key is not present at all, an error is
 // returned without blocking.
 func (c *JWKSCache) getKey(kid string) (*rsa.PublicKey, error) {
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 	c.mu.RLock()
 	key, ok := c.keys[kid]
 	cacheValid := time.Since(c.lastFetch) < jwksCacheDuration
 	c.mu.RUnlock()
 
-<<<<<<< HEAD
-	if ok && cacheValid {
-		return key, nil
-	}
-
-	// If the key is not found or the cache is stale, refresh.
-	if err := c.refresh(); err != nil {
-		return nil, fmt.Errorf("failed to refresh JWKS: %v", err)
-	}
-
-	c.mu.RLock()
-	key, ok = c.keys[kid]
-	c.mu.RUnlock()
-
-=======
 	if !cacheValid {
 		c.triggerBackgroundRefresh()
 	}
 
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 	if !ok {
 		return nil, fmt.Errorf("key %q not found in JWKS", kid)
 	}
@@ -331,8 +271,6 @@ func (c *JWKSCache) getKey(kid string) (*rsa.PublicKey, error) {
 	return key, nil
 }
 
-<<<<<<< HEAD
-=======
 // triggerBackgroundRefresh starts a background goroutine to refresh the JWKS
 // cache, unless a refresh is already in progress.
 func (c *JWKSCache) triggerBackgroundRefresh() {
@@ -352,7 +290,6 @@ func (c *JWKSCache) triggerBackgroundRefresh() {
 	}()
 }
 
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 // refresh fetches the JWKS from the remote endpoint and updates the cache.
 func (c *JWKSCache) refresh() error {
 	resp, err := c.httpClient.Get(c.url)
@@ -405,21 +342,12 @@ type jwksResponse struct {
 }
 
 type jwkKey struct {
-<<<<<<< HEAD
-	Kty string `json:"kty"`
-	Use string `json:"use"`
-	Kid string `json:"kid"`
-	Alg string `json:"alg"`
-	N   string `json:"n"`
-	E   string `json:"e"`
-=======
 	Kty string `json:"kty"` // Key Type: the cryptographic algorithm family (e.g., "RSA")
 	Use string `json:"use"` // Public Key Use: intended use of the key (e.g., "sig" for signature)
 	Kid string `json:"kid"` // Key ID: unique identifier for the key
 	Alg string `json:"alg"` // Algorithm: the algorithm intended for use with the key (e.g., "RS256")
 	N   string `json:"n"`   // Modulus: the RSA modulus (base64url-encoded)
 	E   string `json:"e"`   // Exponent: the RSA public exponent (base64url-encoded)
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 }
 
 // --- OIDC Discovery ---
@@ -465,20 +393,12 @@ func discoverJWKSURL(issuerURL string) (string, error) {
 
 // jwkToRSAPublicKey converts a JWK to an RSA public key.
 func jwkToRSAPublicKey(jwk jwkKey) (*rsa.PublicKey, error) {
-<<<<<<< HEAD
 	nBytes, err := base64URLDecode(jwk.N)
-=======
-	nBytes, err := base64.RawURLEncoding.DecodeString(jwk.N)
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode JWK modulus: %v", err)
 	}
 
-<<<<<<< HEAD
 	eBytes, err := base64URLDecode(jwk.E)
-=======
-	eBytes, err := base64.RawURLEncoding.DecodeString(jwk.E)
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode JWK exponent: %v", err)
 	}
@@ -503,7 +423,6 @@ func verifyRS256Signature(pubKey *rsa.PublicKey, message, signature []byte) erro
 	return rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, h[:], signature)
 }
 
-<<<<<<< HEAD
 // base64URLDecode decodes a base64url-encoded string (with or without padding).
 func base64URLDecode(s string) ([]byte, error) {
 	// Add padding if needed.
@@ -516,8 +435,6 @@ func base64URLDecode(s string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(s)
 }
 
-=======
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 // --- Utility ---
 
 func stringInSlice(s string, slice []string) bool {

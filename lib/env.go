@@ -33,10 +33,7 @@ func GetAuthMode() AuthMode {
 
 // GetOIDCIssuerURL returns the OIDC issuer URL from the VPROX_OIDC_ISSUER
 // environment variable. Defaults to "https://oidc.modal.com" if not set.
-<<<<<<< HEAD
-=======
 // Useful for testing Modal OIDC endpoints other than default.
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 func GetOIDCIssuerURL() string {
 	issuer := os.Getenv("VPROX_OIDC_ISSUER")
 	if issuer == "" {

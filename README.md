@@ -234,10 +234,7 @@ On AWS in particular, the `--cloud aws` option allows you to automatically disco
 - Optimized for throughput with automatic MTU, MSS, GSO/GRO, and multi-queue configuration
 - Connection tracking bypass (NOTRACK) for reduced CPU overhead on WireGuard UDP flows
 - OIDC authentication for passwordless auth from Modal containers (`oidc-modal`)
-<<<<<<< HEAD
 - Edge connectors for accessing private VPC resources through the server (outbound-only, no inbound ports required)
-=======
->>>>>>> 2b1dd393599f5cca0da832a01a1b3cd966b4b8da
 
 ## Authors
 
