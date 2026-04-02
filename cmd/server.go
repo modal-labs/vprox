@@ -24,12 +24,13 @@ var ServerCmd = &cobra.Command{
 }
 
 var serverCmdArgs struct {
-	ip           []string
-	wgBlock      string
-	wgBlockPerIp string
-	cloud        string
-	takeover     bool
-	controlPort  int
+	ip               []string
+	wgBlock          string
+	wgBlockPerIp     string
+	cloud            string
+	takeover         bool
+	controlPort      int
+	inheritListeners string
 }
 
 func init() {
@@ -45,6 +46,8 @@ func init() {
 		false, "Take over existing WireGuard state from a previous server instance (for non-disruptive upgrades)")
 	ServerCmd.Flags().IntVar(&serverCmdArgs.controlPort, "control-port",
 		lib.DefaultControlPort, "Port for the upgrade control server (0 to disable)")
+	ServerCmd.Flags().StringVar(&serverCmdArgs.inheritListeners, "inherit-listeners",
+		"", "Unix socket path to inherit HTTPS listeners from during an upgrade (internal use)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
@@ -53,7 +56,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("unknown value of --cloud: %v", cloud)
 	}
 
-	if cloud == "" && len(serverCmdArgs.ip) == 0 {
+	// When inheriting listeners the IPs come from the Unix socket metadata,
+	// so --ip is not required.
+	if cloud == "" && len(serverCmdArgs.ip) == 0 && serverCmdArgs.inheritListeners == "" {
 		return errors.New("missing required flag: --ip")
 	}
 	if len(serverCmdArgs.ip) > 1024 {
@@ -112,7 +117,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 	defer done()
 	defer sm.Wait()
 
-	// Start the control server for upgrade orchestration.
+	// Start the control server for upgrade orchestration. During an upgrade
+	// the old process may still hold the port briefly; the control server
+	// retries binding internally.
 	if serverCmdArgs.controlPort > 0 {
 		cs := lib.NewControlServer(sm, serverCmdArgs.controlPort, done)
 		cs.SetCloud(cloud)
@@ -123,13 +130,48 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
+	// If we are inheriting listeners from an old process (via Unix socket FD
+	// passing), receive them, start servers on the inherited sockets, wait
+	// until every server is actively accepting, and only then ack the old
+	// process so it can shut down. This ensures there is never a moment
+	// where no process is accepting connections on :443.
+	if serverCmdArgs.inheritListeners != "" {
+		handoff, err := lib.ReceiveListenerFDs(serverCmdArgs.inheritListeners)
+		if err != nil {
+			return fmt.Errorf("failed to inherit listeners: %v", err)
+		}
+		for _, il := range handoff.Listeners() {
+			ip, err := netip.ParseAddr(il.Meta.BindAddr)
+			if err != nil || !ip.Is4() {
+				return fmt.Errorf("invalid inherited bind address: %q", il.Meta.BindAddr)
+			}
+			if err := sm.StartWithListener(ip, il.Listener); err != nil {
+				return fmt.Errorf("failed to start server on inherited listener %v: %v", ip, err)
+			}
+		}
+		// Block until every inherited server's accept loop is running,
+		// then tell the old process it is safe to tear down.
+		sm.WaitAllServing()
+		handoff.Ack()
+	}
+
 	if cloud == "aws" {
-		initialIps, err := pollAws(lib.NewAwsMetadata(), make(ipSet), sm)
+		// Seed the current-IP set with any servers that were already started
+		// via inherited listeners so pollAws doesn't try to Start them again.
+		initialCurrentIps := make(ipSet)
+		for _, ip := range sm.ActiveIPs() {
+			initialCurrentIps[ip] = struct{}{}
+		}
+
+		initialIps, err := pollAws(lib.NewAwsMetadata(), initialCurrentIps, sm)
 		if err != nil {
 			return err
 		}
 
 		pollAwsLoop(ctx, sm, initialIps)
+	} else if serverCmdArgs.inheritListeners != "" {
+		// Listeners already started above; just wait for shutdown.
+		sm.Wait()
 	} else {
 		for _, ipStr := range serverCmdArgs.ip {
 			ip, err := netip.ParseAddr(ipStr)

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,6 +93,21 @@ type Server struct {
 	// takeover indicates this server should take over existing WireGuard state
 	// instead of creating a fresh interface. Used for non-disruptive upgrades.
 	takeover bool
+
+	// listener holds the active TCP listener so it can be extracted for FD
+	// handoff during upgrades.
+	listener net.Listener
+
+	// InheritedListener, if non-nil, is a TCP listener received from the old
+	// server process during an upgrade. ListenForHttps will serve on this
+	// listener instead of creating a new one.
+	InheritedListener net.Listener
+
+	// Serving is closed just before the HTTPS accept loop starts. Callers
+	// can wait on this channel to know the server is actively accepting
+	// connections, which is used during upgrades to defer the handoff ack
+	// until the new process is ready.
+	Serving chan struct{}
 }
 
 // InitState initializes the private server state.
@@ -447,6 +463,21 @@ func (srv *Server) Ifname() string {
 	return fmt.Sprintf("vprox%d", srv.Index)
 }
 
+// ListenerFile returns a dup'd file descriptor for the server's active TCP
+// listener. The caller is responsible for closing the returned *os.File.
+// This is used during upgrades to pass the listener to a new process via
+// SCM_RIGHTS without interrupting the current server's accept loop.
+func (srv *Server) ListenerFile() (*os.File, error) {
+	if srv.listener == nil {
+		return nil, fmt.Errorf("server %v has no active listener", srv.BindAddr)
+	}
+	tcpListener, ok := srv.listener.(*net.TCPListener)
+	if !ok {
+		return nil, fmt.Errorf("listener for %v is %T, not *net.TCPListener", srv.BindAddr, srv.listener)
+	}
+	return tcpListener.File()
+}
+
 func (srv *Server) StartWireguard() error {
 	ifname := srv.Ifname()
 	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
@@ -600,6 +631,15 @@ func (srv *Server) StartIptables() error {
 }
 
 func (srv *Server) CleanupIptables() {
+	srv.mu.Lock()
+	relinquished := srv.relinquished
+	srv.mu.Unlock()
+
+	if relinquished {
+		log.Printf("[%v] skipping iptables cleanup (relinquished)", srv.BindAddr)
+		return
+	}
+
 	if err := srv.iptablesInputFwmarkRule(false); err != nil {
 		log.Printf("warning: error cleaning up IP tables: failed to add fwmark rule: %v\n", err)
 	}
@@ -784,14 +824,25 @@ func (srv *Server) ListenForHttps() error {
 		},
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("%v:443", srv.BindAddr))
-	if err != nil {
-		return fmt.Errorf("failed to listen on :443: %v", err)
+	var listener net.Listener
+	if srv.InheritedListener != nil {
+		listener = srv.InheritedListener
+		log.Printf("[%v] using inherited listener for %v:443", srv.BindAddr, srv.BindAddr)
+	} else {
+		var err error
+		listener, err = net.Listen("tcp", fmt.Sprintf("%v:443", srv.BindAddr))
+		if err != nil {
+			return fmt.Errorf("failed to listen on :443: %v", err)
+		}
 	}
+	srv.listener = listener
 
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("server listening on %v:443\n", srv.BindAddr)
+		if srv.Serving != nil {
+			close(srv.Serving)
+		}
 		err = httpServer.ServeTLS(listener, "", "")
 		if err != http.ErrServerClosed {
 			errCh <- fmt.Errorf("https server failed to serve %v: %v", srv.BindAddr, err)

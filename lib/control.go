@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -46,8 +47,10 @@ type controlInfoResponse struct {
 
 // controlShutdownResponse is returned by POST /shutdown.
 type controlShutdownResponse struct {
-	Status          string   `json:"status"`
-	RelinquishedIPs []string `json:"relinquished_ips"`
+	Status          string         `json:"status"`
+	RelinquishedIPs []string       `json:"relinquished_ips"`
+	FDSocket        string         `json:"fd_socket"`
+	Listeners       []ListenerMeta `json:"listeners"`
 }
 
 // SetCloud stores the cloud provider string so it can be reported in /info.
@@ -57,6 +60,10 @@ func (cs *ControlServer) SetCloud(cloud string) {
 
 // Start begins listening for control requests on localhost. It blocks until the
 // context is done or an error occurs.
+//
+// During an upgrade the old control server may still hold the port for a few
+// seconds while it drains. Start retries binding with a backoff for up to 10
+// seconds so the new process can take over cleanly.
 func (cs *ControlServer) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/info", cs.infoHandler)
@@ -66,12 +73,27 @@ func (cs *ControlServer) Start(ctx context.Context) error {
 		Handler: mux,
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cs.port))
+	addr := fmt.Sprintf("127.0.0.1:%d", cs.port)
+
+	var listener net.Listener
+	var err error
+	for attempt := 0; attempt < 20; attempt++ {
+		listener, err = net.Listen("tcp", addr)
+		if err == nil {
+			break
+		}
+		// If the context is already done, bail out immediately.
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 	if err != nil {
-		return fmt.Errorf("control server: failed to listen on 127.0.0.1:%d: %v", cs.port, err)
+		return fmt.Errorf("control server: failed to listen on %s after retries: %v", addr, err)
 	}
 
-	log.Printf("control server listening on 127.0.0.1:%d", cs.port)
+	log.Printf("control server listening on %s", addr)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -125,29 +147,69 @@ func (cs *ControlServer) infoHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(respBuf)
 }
 
-// shutdownHandler triggers a graceful shutdown of the running server.
-// It relinquishes all active servers (preserving WireGuard state) and then
-// cancels the server context so the process exits.
+// shutdownHandler performs a two-phase graceful shutdown for zero-downtime upgrades:
+//
+//  1. Mark every active server as relinquished so that /connect and /disconnect
+//     start returning 503, and WireGuard + iptables state will be preserved on exit.
+//  2. Collect a dup'd file descriptor for every active HTTPS listener.
+//  3. Create a Unix domain socket and return its path in the HTTP response so the
+//     new process knows where to connect.
+//  4. In a background goroutine, wait for the new process to connect and receive
+//     the FDs via SCM_RIGHTS, then cancel all server contexts and the top-level
+//     context so the old process exits.
+//
+// If anything goes wrong before the FD handoff (e.g. the new process never
+// connects), the background goroutine still cancels everything so the old
+// process doesn't hang forever.
 func (cs *ControlServer) shutdownHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Relinquish all active servers so WireGuard state is preserved.
-	relinquishedIPs := make([]string, 0)
+	// Phase 1: mark all servers as relinquished (503 for new client requests,
+	// skip WireGuard/iptables cleanup on exit). We deliberately do NOT cancel
+	// their contexts yet — the HTTPS listeners must stay alive so the kernel
+	// socket remains open while we dup the FD and hand it off.
+	relinquishedIPs := make([]string, 0, len(cs.sm.activeServers))
 	for ip := range cs.sm.activeServers {
-		cs.sm.RelinquishServer(ip)
+		cs.sm.MarkRelinquished(ip)
 		relinquishedIPs = append(relinquishedIPs, ip.String())
 	}
 
+	// Phase 2: collect a dup'd FD for every active listener.
+	files, meta, err := cs.sm.CollectListenerFiles()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to collect listener FDs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Phase 3: create the Unix socket that the new process will connect to.
+	unixListener, err := CreateUpgradeSocket()
+	if err != nil {
+		for _, f := range files {
+			f.Close()
+		}
+		http.Error(w, fmt.Sprintf("failed to create upgrade socket: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	msg := &handoffMessage{Listeners: meta}
+
+	// Build and send the HTTP response before we block on the FD handoff.
 	resp := &controlShutdownResponse{
-		Status:          "shutting_down",
+		Status:          "awaiting_handoff",
 		RelinquishedIPs: relinquishedIPs,
+		FDSocket:        UpgradeSocketPath,
+		Listeners:       meta,
 	}
 
 	respBuf, err := json.Marshal(resp)
 	if err != nil {
+		unixListener.Close()
+		for _, f := range files {
+			f.Close()
+		}
 		http.Error(w, "failed to serialize response", http.StatusInternalServerError)
 		return
 	}
@@ -155,16 +217,41 @@ func (cs *ControlServer) shutdownHandler(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(respBuf)
 
-	// Flush the response before shutting down.
+	// Flush so the upgrade command receives the response immediately.
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
 
-	// Cancel the top-level context to trigger graceful shutdown.
-	// Do this in a goroutine so the HTTP response completes first.
+	// Phase 4: hand off the FDs to the new process in the background, then
+	// tear down the old process.
 	go func() {
+		defer func() {
+			for _, f := range files {
+				f.Close()
+			}
+		}()
+
+		if err := ServeListenerFDs(unixListener, msg, files); err != nil {
+			log.Printf("control server: FD handoff failed: %v", err)
+			log.Printf("control server: shutting down without successful handoff")
+		} else {
+			log.Printf("control server: FD handoff complete — new process has the listeners")
+		}
+
+		// Give the HTTP response a moment to finish writing, then bring
+		// everything down. CancelAll stops each server's HTTPS accept
+		// loop and cleanup routines; cancelFn stops the top-level context
+		// (which also stops this control server, the AWS poll loop, etc).
 		time.Sleep(100 * time.Millisecond)
-		log.Printf("control server: triggering shutdown after upgrade request")
+		cs.sm.CancelAll()
+
+		// Small grace period so the per-server goroutines notice their
+		// cancelled contexts before we yank the top-level context.
+		time.Sleep(100 * time.Millisecond)
+		log.Printf("control server: triggering process exit")
 		cs.cancelFn()
 	}()
+
+	// Log a summary for operators tailing the journal.
+	fmt.Fprintf(os.Stderr, "control server: upgrade initiated — %d listener(s) queued for handoff\n", len(files))
 }

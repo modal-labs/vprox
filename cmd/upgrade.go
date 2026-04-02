@@ -5,14 +5,13 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 
 	"github.com/modal-labs/vprox/lib"
@@ -24,6 +23,10 @@ var UpgradeCmd = &cobra.Command{
 	Long: `Connects to the control port of a running vprox server, retrieves its
 configuration, triggers a graceful shutdown (preserving WireGuard state),
 and then starts the current binary as the new server with --takeover.
+
+The old server passes its HTTPS listener file descriptors to the new process
+via a Unix socket (SCM_RIGHTS), so there is zero control-plane downtime.
+Connected WireGuard peers are completely unaffected.
 
 The old server must have been started with the control server enabled.
 The control server listens on localhost only, so no authentication is required.`,
@@ -42,7 +45,7 @@ func init() {
 	UpgradeCmd.Flags().IntVar(&upgradeCmdArgs.controlPort, "port",
 		lib.DefaultControlPort, "Port of the running vprox control server")
 	UpgradeCmd.Flags().IntVar(&upgradeCmdArgs.timeout, "timeout",
-		30, "Timeout in seconds to wait for old server to exit")
+		30, "Timeout in seconds to wait for the upgrade to complete")
 }
 
 // upgradeInfoResponse mirrors lib.controlInfoResponse for the client side.
@@ -56,55 +59,40 @@ type upgradeInfoResponse struct {
 	Takeover     bool     `json:"takeover"`
 }
 
+// upgradeListenerMeta mirrors lib.ListenerMeta for the client side.
+type upgradeListenerMeta struct {
+	BindAddr string `json:"bind_addr"`
+	Index    uint16 `json:"index"`
+}
+
 type upgradeShutdownResponse struct {
-	Status          string   `json:"status"`
-	RelinquishedIPs []string `json:"relinquished_ips"`
+	Status          string                `json:"status"`
+	RelinquishedIPs []string              `json:"relinquished_ips"`
+	FDSocket        string                `json:"fd_socket"`
+	Listeners       []upgradeListenerMeta `json:"listeners"`
 }
 
 func runUpgrade(cmd *cobra.Command, args []string) error {
 	controlBase := fmt.Sprintf("http://%s:%d", upgradeCmdArgs.controlAddr, upgradeCmdArgs.controlPort)
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
-	// Step 1: Get info from running server.
-	bold := color.New(color.Bold)
-	fmt.Printf("%s Connecting to control server at %s\n", bold.Sprint("==>"), controlBase)
-
 	info, err := getControlInfo(httpClient, controlBase)
 	if err != nil {
 		return fmt.Errorf("failed to get server info: %v", err)
 	}
-
-	fmt.Printf("    Running server version: %s (%s)\n", info.GitTag, info.GitCommit)
-	fmt.Printf("    New binary version:     %s (%s)\n", lib.GitTag, lib.GitCommit)
-	fmt.Printf("    WG block:               %s (per-ip: /%d)\n", info.WgBlock, info.WgBlockPerIp)
-	fmt.Printf("    Active IPs:             %v\n", info.ActiveIPs)
-	fmt.Printf("    Cloud:                  %s\n", info.Cloud)
-
-	// Step 2: Request graceful shutdown.
-	fmt.Printf("\n%s Requesting graceful shutdown (preserving WireGuard state)...\n", bold.Sprint("==>"))
+	log.Printf("upgrade: old=%s (%s), new=%s (%s), ips=[%s], wg-block=%s",
+		info.GitTag, info.GitCommit, lib.GitTag, lib.GitCommit,
+		strings.Join(info.ActiveIPs, ", "), info.WgBlock)
 
 	shutdownResp, err := requestControlShutdown(httpClient, controlBase)
 	if err != nil {
 		return fmt.Errorf("failed to request shutdown: %v", err)
 	}
+	log.Printf("upgrade: relinquished %d IP(s), handing off %d listener(s) via %s",
+		len(shutdownResp.RelinquishedIPs), len(shutdownResp.Listeners), shutdownResp.FDSocket)
 
-	fmt.Printf("    Status: %s\n", shutdownResp.Status)
-	fmt.Printf("    Relinquished IPs: %v\n", shutdownResp.RelinquishedIPs)
-
-	// Step 3: Wait for old process to release the control port.
-	fmt.Printf("\n%s Waiting for old server to exit...\n", bold.Sprint("==>"))
-
-	deadline := time.Now().Add(time.Duration(upgradeCmdArgs.timeout) * time.Second)
-	if err := waitForPortFree(upgradeCmdArgs.controlPort, deadline); err != nil {
-		return fmt.Errorf("timed out waiting for old server to exit: %v", err)
-	}
-
-	fmt.Printf("    Old server has exited.\n")
-
-	// Step 4: Start the new server with --takeover.
-	fmt.Printf("\n%s Starting new server with --takeover...\n", bold.Sprint("==>"))
-
-	return execNewServer(info)
+	log.Printf("upgrade: starting new server with --takeover --inherit-listeners")
+	return execNewServer(info, shutdownResp.FDSocket)
 }
 
 func getControlInfo(client *http.Client, baseURL string) (*upgradeInfoResponse, error) {
@@ -167,38 +155,33 @@ func requestControlShutdown(client *http.Client, baseURL string) (*upgradeShutdo
 	return &shutdownResp, nil
 }
 
-// waitForPortFree polls until the given TCP port is no longer listening.
-func waitForPortFree(port int, deadline time.Time) error {
-	addr := fmt.Sprintf("localhost:%d", port)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
-		if err != nil {
-			// Port is free — old server has exited.
-			return nil
-		}
-		conn.Close()
-		time.Sleep(250 * time.Millisecond)
-	}
-	return fmt.Errorf("port %d still in use after timeout", port)
-}
-
-// execNewServer starts the current binary as a new vprox server with --takeover.
-func execNewServer(info *upgradeInfoResponse) error {
+// execNewServer starts the current binary as a new vprox server with --takeover
+// and --inherit-listeners pointing at the Unix socket where the old process is
+// waiting to hand off its HTTPS listener FDs.
+func execNewServer(info *upgradeInfoResponse, fdSocket string) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to determine current executable path: %v", err)
 	}
 
-	serverArgs := []string{"server", "--takeover", "--wg-block", info.WgBlock}
+	serverArgs := []string{
+		"server",
+		"--takeover",
+		"--wg-block", info.WgBlock,
+		"--inherit-listeners", fdSocket,
+	}
 
 	if info.WgBlockPerIp > 0 {
-		serverArgs = append(serverArgs, "--wg-block-per-ip", "/"+strconv.FormatUint(uint64(info.WgBlockPerIp), 10))
+		serverArgs = append(serverArgs, "--wg-block-per-ip",
+			"/"+strconv.FormatUint(uint64(info.WgBlockPerIp), 10))
 	}
 
 	if info.Cloud != "" {
 		serverArgs = append(serverArgs, "--cloud", info.Cloud)
 	} else {
-		// No cloud mode — pass IPs explicitly.
+		// Pass explicit IPs so they show up in ps(1) output and satisfy
+		// flag validation, even though the actual sockets come from the
+		// inherited listeners.
 		for _, ip := range info.ActiveIPs {
 			serverArgs = append(serverArgs, "--ip", ip)
 		}
@@ -211,6 +194,5 @@ func execNewServer(info *upgradeInfoResponse) error {
 	execCmd.Stdout = os.Stdout
 	execCmd.Stderr = os.Stderr
 
-	// Replace the current process.
 	return execCmd.Run()
 }

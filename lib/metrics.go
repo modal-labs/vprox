@@ -1,7 +1,9 @@
 package lib
 
 import (
+	"context"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -39,13 +41,40 @@ var (
 )
 
 // StartMetricsServer starts an HTTP server on :9090 serving Prometheus metrics.
-// CPU and network bandwidth metrics are expected from the host-level Vector/DD agent.
-func StartMetricsServer() {
+// It shuts down when ctx is cancelled. During upgrades the old process may still
+// hold the port, so binding is retried for up to 10 seconds.
+func StartMetricsServer(ctx context.Context) {
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
+
+		var listener net.Listener
+		var err error
+		for attempt := 0; attempt < 20; attempt++ {
+			listener, err = net.Listen("tcp", ":9090")
+			if err == nil {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+		if err != nil {
+			log.Printf("metrics server failed after retries: %v", err)
+			return
+		}
+
+		server := &http.Server{Handler: mux}
 		log.Printf("metrics server listening on :9090")
-		if err := http.ListenAndServe(":9090", mux); err != nil {
+
+		go func() {
+			<-ctx.Done()
+			server.Close()
+		}()
+
+		if err := server.Serve(listener); err != http.ErrServerClosed {
 			log.Printf("metrics server failed: %v", err)
 		}
 	}()
