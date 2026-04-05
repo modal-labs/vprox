@@ -45,6 +45,12 @@ type PeerInfo struct {
 	PeerIp         netip.Addr
 }
 
+// EdgePeerInfo extends PeerInfo with route advertisements for edge connectors.
+type EdgePeerInfo struct {
+	PeerInfo
+	AdvertisedRoutes []netip.Prefix
+}
+
 // Server handles state for one WireGuard network.
 //
 // The `vprox server` command should create one Server instance for each
@@ -82,8 +88,9 @@ type Server struct {
 
 	ipAllocator *IpAllocator
 
-	mu       sync.Mutex // Protects the fields below.
-	allPeers map[wgtypes.Key]PeerInfo
+	mu        sync.Mutex // Protects the fields below.
+	allPeers  map[wgtypes.Key]PeerInfo
+	edgePeers map[wgtypes.Key]EdgePeerInfo
 
 	// relinquished indicates this server should not clean up WireGuard state on exit.
 	// Set via the /relinquish endpoint for non-disruptive upgrades.
@@ -111,6 +118,7 @@ func (srv *Server) InitState() error {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
 	srv.allPeers = make(map[wgtypes.Key]PeerInfo)
+	srv.edgePeers = make(map[wgtypes.Key]EdgePeerInfo)
 
 	// In takeover mode, initialize state from existing WireGuard peers if device exists
 	if srv.takeover {
@@ -352,6 +360,249 @@ func (srv *Server) disconnectHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(respBuf)
 }
 
+// --- Edge connector handlers ---
+
+type edgeConnectRequest struct {
+	PeerPublicKey string   `json:"peer_public_key"`
+	Routes        []string `json:"routes"`
+}
+
+type edgeConnectResponse struct {
+	AssignedAddr     string `json:"assigned_addr"`
+	ServerPublicKey  string `json:"server_public_key"`
+	ServerListenPort int    `json:"server_listen_port"`
+}
+
+// hasRouteConflict checks if any of the given routes conflict with existing edge
+// routes or the WireGuard CIDR. Must be called with srv.mu held.
+func (srv *Server) hasRouteConflict(routes []netip.Prefix, excludeKey *wgtypes.Key) error {
+	for _, route := range routes {
+		if route.Overlaps(srv.WgCidr) {
+			return fmt.Errorf("route %v overlaps with WireGuard CIDR %v", route, srv.WgCidr)
+		}
+		for key, edge := range srv.edgePeers {
+			if excludeKey != nil && key == *excludeKey {
+				continue
+			}
+			for _, existing := range edge.AdvertisedRoutes {
+				if route.Overlaps(existing) {
+					return fmt.Errorf("route %v overlaps with existing edge route %v", route, existing)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Handle a new edge connector peering request.
+func (srv *Server) edgeConnectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := srv.Auth.Authenticate(r); err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	buf, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	req := &edgeConnectRequest{}
+	if err = json.Unmarshal(buf, req); err != nil {
+		http.Error(w, "failed to parse request body", http.StatusBadRequest)
+		return
+	}
+
+	peerKey, err := wgtypes.ParseKey(req.PeerPublicKey)
+	if err != nil {
+		http.Error(w, "invalid peer public key", http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Routes) == 0 {
+		http.Error(w, "at least one route must be advertised", http.StatusBadRequest)
+		return
+	}
+
+	// Parse and validate routes.
+	var routes []netip.Prefix
+	for _, routeStr := range req.Routes {
+		prefix, err := netip.ParsePrefix(routeStr)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid route %q: %v", routeStr, err), http.StatusBadRequest)
+			return
+		}
+		prefix = prefix.Masked()
+		if !prefix.Addr().Is4() {
+			http.Error(w, fmt.Sprintf("only IPv4 routes are supported, got %q", routeStr), http.StatusBadRequest)
+			return
+		}
+		routes = append(routes, prefix)
+	}
+
+	// Hold the lock from conflict check through map update to make route
+	// registration atomic — prevents two concurrent edge connects from both
+	// passing the conflict check and then registering overlapping routes.
+	srv.mu.Lock()
+
+	// Check for route conflicts (allow re-registration by the same key).
+	if err := srv.hasRouteConflict(routes, &peerKey); err != nil {
+		srv.mu.Unlock()
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+
+	prevPeerInfo, exists := srv.allPeers[peerKey]
+	var prevEdgeInfo EdgePeerInfo
+	if exists {
+		prevEdgeInfo = srv.edgePeers[peerKey]
+	}
+
+	// If the edge already exists as a peer, reuse its IP.
+	var peerIp netip.Addr
+	isNewAllocation := false
+	if exists {
+		peerIp = prevPeerInfo.PeerIp
+	} else {
+		peerIp = srv.ipAllocator.Allocate()
+		isNewAllocation = true
+	}
+
+	if peerIp.IsUnspecified() {
+		srv.mu.Unlock()
+		log.Printf("no more ip addresses available in %v", srv.WgCidr)
+		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Build AllowedIPs: the peer's own /32 plus all advertised routes.
+	allowedIPs := []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))}
+	for _, route := range routes {
+		allowedIPs = append(allowedIPs, prefixToIPNet(route))
+	}
+
+	// Commit the new peer/route state to the maps while still holding the
+	// lock, so no other handler can register conflicting routes in between.
+	srv.allPeers[peerKey] = PeerInfo{
+		ConnectionTime: time.Now(),
+		PeerIp:         peerIp,
+	}
+	srv.edgePeers[peerKey] = EdgePeerInfo{
+		PeerInfo: PeerInfo{
+			ConnectionTime: time.Now(),
+			PeerIp:         peerIp,
+		},
+		AdvertisedRoutes: routes,
+	}
+
+	srv.mu.Unlock()
+
+	clientIp := strings.Split(r.RemoteAddr, ":")[0]
+	log.Printf("[%v] new edge peer %v at %v: %v (routes: %v)", srv.BindAddr, clientIp, peerIp, peerKey, routes)
+	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
+		Peers: []wgtypes.PeerConfig{
+			{
+				PublicKey:         peerKey,
+				ReplaceAllowedIPs: true,
+				AllowedIPs:        allowedIPs,
+			},
+		},
+	})
+	if err != nil {
+		srv.mu.Lock()
+		if exists {
+			// Restore prior map state for re-registrations.
+			srv.allPeers[peerKey] = prevPeerInfo
+			srv.edgePeers[peerKey] = prevEdgeInfo
+		} else {
+			delete(srv.allPeers, peerKey)
+			delete(srv.edgePeers, peerKey)
+		}
+		srv.mu.Unlock()
+
+		if isNewAllocation {
+			srv.ipAllocator.Free(peerIp)
+		}
+		log.Printf("failed to configure WireGuard edge peer: %v", err)
+		http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
+		return
+	}
+
+	resp := &edgeConnectResponse{
+		AssignedAddr:     fmt.Sprintf("%v/%d", peerIp, srv.WgCidr.Bits()),
+		ServerPublicKey:  srv.Key.PublicKey().String(),
+		ServerListenPort: WireguardListenPortBase + int(srv.Index),
+	}
+
+	respBuf, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, "failed to serialize response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(respBuf)
+}
+
+// Handle an edge connector disconnect request.
+func (srv *Server) edgeDisconnectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := srv.Auth.Authenticate(r); err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	buf, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	req := &edgeDisconnectRequest{}
+	if err = json.Unmarshal(buf, req); err != nil {
+		http.Error(w, "failed to parse request body", http.StatusBadRequest)
+		return
+	}
+
+	peerKey, err := wgtypes.ParseKey(req.PeerPublicKey)
+	if err != nil {
+		http.Error(w, "invalid peer public key", http.StatusBadRequest)
+		return
+	}
+
+	clientIp := strings.Split(r.RemoteAddr, ":")[0]
+	log.Printf("[%v] edge disconnect request from %v: %v", srv.BindAddr, clientIp, peerKey)
+
+	err = srv.cleanupPeer(peerKey)
+	if err != nil {
+		log.Printf("failed to cleanup edge peer %v: %v", peerKey, err)
+		http.Error(w, "failed to cleanup peer", http.StatusInternalServerError)
+		return
+	}
+
+	resp := &disconnectResponse{
+		Status: "success",
+	}
+
+	respBuf, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, "failed to serialize response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(respBuf)
+}
+
 type relinquishResponse struct {
 	Status string
 }
@@ -529,6 +780,7 @@ func (srv *Server) iptablesSnatRule(enabled bool) error {
 	firewallMark := FwmarkBase + int(srv.Index)
 	rule := []string{
 		"-m", "mark", "--mark", strconv.Itoa(firewallMark),
+		"-o", srv.BindIface.Attrs().Name,
 		"-j", "SNAT", "--to-source", srv.BindAddr.String(),
 		"-m", "comment", "--comment", fmt.Sprintf("vprox snat rule for %s", srv.Ifname()),
 	}
@@ -623,9 +875,10 @@ func (srv *Server) cleanupPeer(publicKey wgtypes.Key) error {
 		return nil
 	}
 
-	// Extract peer info and remove from allPeers.
+	// Extract peer info and remove from allPeers and edgePeers.
 	peerIp := peerInfo.PeerIp
 	delete(srv.allPeers, publicKey)
+	delete(srv.edgePeers, publicKey)
 	srv.mu.Unlock()
 
 	// Remove the peer from WireGuard (no lock held during WireGuard operations).
@@ -688,11 +941,16 @@ func (srv *Server) removeIdlePeers() error {
 					removeIps = append(removeIps, netip.AddrFrom4([4]byte(ipv4)))
 				}
 			}
+			if edgeInfo, isEdge := srv.edgePeers[peer.PublicKey]; isEdge {
+				log.Printf("[%v] removing idle edge peer with routes: %v",
+					srv.BindAddr, edgeInfo.AdvertisedRoutes)
+			}
 			removePeers = append(removePeers, wgtypes.PeerConfig{
 				PublicKey: peer.PublicKey,
 				Remove:    true,
 			})
 			delete(srv.allPeers, peer.PublicKey)
+			delete(srv.edgePeers, peer.PublicKey)
 		}
 	}
 
@@ -748,6 +1006,8 @@ func (srv *Server) ListenForHttps() error {
 	mux.HandleFunc("/", srv.indexHandler)
 	mux.HandleFunc("/connect", srv.connectHandler)
 	mux.HandleFunc("/disconnect", srv.disconnectHandler)
+	mux.HandleFunc("/edge-connect", srv.edgeConnectHandler)
+	mux.HandleFunc("/edge-disconnect", srv.edgeDisconnectHandler)
 	mux.HandleFunc("/relinquish", srv.relinquishHandler)
 	mux.HandleFunc("/version", srv.versionHandler)
 
