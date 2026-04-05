@@ -445,7 +445,11 @@ func (srv *Server) edgeConnectHandler(w http.ResponseWriter, r *http.Request) {
 		routes = append(routes, prefix)
 	}
 
+	// Hold the lock from conflict check through map update to make route
+	// registration atomic — prevents two concurrent edge connects from both
+	// passing the conflict check and then registering overlapping routes.
 	srv.mu.Lock()
+
 	// Check for route conflicts (allow re-registration by the same key).
 	if err := srv.hasRouteConflict(routes, &peerKey); err != nil {
 		srv.mu.Unlock()
@@ -458,7 +462,6 @@ func (srv *Server) edgeConnectHandler(w http.ResponseWriter, r *http.Request) {
 	if exists {
 		prevEdgeInfo = srv.edgePeers[peerKey]
 	}
-	srv.mu.Unlock()
 
 	// If the edge already exists as a peer, reuse its IP.
 	var peerIp netip.Addr
@@ -471,6 +474,7 @@ func (srv *Server) edgeConnectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if peerIp.IsUnspecified() {
+		srv.mu.Unlock()
 		log.Printf("no more ip addresses available in %v", srv.WgCidr)
 		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
 		return
@@ -482,7 +486,8 @@ func (srv *Server) edgeConnectHandler(w http.ResponseWriter, r *http.Request) {
 		allowedIPs = append(allowedIPs, prefixToIPNet(route))
 	}
 
-	srv.mu.Lock()
+	// Commit the new peer/route state to the maps while still holding the
+	// lock, so no other handler can register conflicting routes in between.
 	srv.allPeers[peerKey] = PeerInfo{
 		ConnectionTime: time.Now(),
 		PeerIp:         peerIp,
@@ -494,6 +499,7 @@ func (srv *Server) edgeConnectHandler(w http.ResponseWriter, r *http.Request) {
 		},
 		AdvertisedRoutes: routes,
 	}
+
 	srv.mu.Unlock()
 
 	clientIp := strings.Split(r.RemoteAddr, ":")[0]
