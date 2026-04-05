@@ -437,7 +437,12 @@ func (srv *Server) edgeConnectHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("invalid route %q: %v", routeStr, err), http.StatusBadRequest)
 			return
 		}
-		routes = append(routes, prefix.Masked())
+		prefix = prefix.Masked()
+		if !prefix.Addr().Is4() {
+			http.Error(w, fmt.Sprintf("only IPv4 routes are supported, got %q", routeStr), http.StatusBadRequest)
+			return
+		}
+		routes = append(routes, prefix)
 	}
 
 	srv.mu.Lock()
