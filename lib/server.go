@@ -561,7 +561,7 @@ func (srv *Server) edgeDisconnectHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	req := &disconnectRequest{}
+	req := &edgeDisconnectRequest{}
 	if err = json.Unmarshal(buf, req); err != nil {
 		http.Error(w, "failed to parse request body", http.StatusBadRequest)
 		return
