@@ -453,15 +453,21 @@ func (srv *Server) edgeConnectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	peerInfo, exists := srv.allPeers[peerKey]
+	prevPeerInfo, exists := srv.allPeers[peerKey]
+	var prevEdgeInfo EdgePeerInfo
+	if exists {
+		prevEdgeInfo = srv.edgePeers[peerKey]
+	}
 	srv.mu.Unlock()
 
 	// If the edge already exists as a peer, reuse its IP.
 	var peerIp netip.Addr
+	isNewAllocation := false
 	if exists {
-		peerIp = peerInfo.PeerIp
+		peerIp = prevPeerInfo.PeerIp
 	} else {
 		peerIp = srv.ipAllocator.Allocate()
+		isNewAllocation = true
 	}
 
 	if peerIp.IsUnspecified() {
@@ -503,11 +509,19 @@ func (srv *Server) edgeConnectHandler(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		srv.mu.Lock()
-		delete(srv.allPeers, peerKey)
-		delete(srv.edgePeers, peerKey)
+		if exists {
+			// Restore prior map state for re-registrations.
+			srv.allPeers[peerKey] = prevPeerInfo
+			srv.edgePeers[peerKey] = prevEdgeInfo
+		} else {
+			delete(srv.allPeers, peerKey)
+			delete(srv.edgePeers, peerKey)
+		}
 		srv.mu.Unlock()
 
-		srv.ipAllocator.Free(peerIp)
+		if isNewAllocation {
+			srv.ipAllocator.Free(peerIp)
+		}
 		log.Printf("failed to configure WireGuard edge peer: %v", err)
 		http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
 		return
