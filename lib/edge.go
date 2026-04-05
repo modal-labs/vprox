@@ -406,7 +406,6 @@ func (e *EdgeClient) forwardInRule(outIface string) []string {
 
 func (e *EdgeClient) mssClampRule() []string {
 	return []string{
-		"-o", e.Ifname,
 		"-p", "tcp",
 		"--tcp-flags", "SYN,RST", "SYN",
 		"-j", "TCPMSS",
