@@ -24,10 +24,8 @@ import (
 const healthCheckInterval = 2 * time.Second
 
 // how long do we wait for the tunnel's first handshake before giving up?
-// this spans several of WireGuard's REKEY_TIMEOUT (5s) handshake retries, so
-// that a single dropped handshake packet doesn't fail the connection.
-const initialHandshakeTimeout = 20 * time.Second
-
+// Keep this higher than WireGuard's REKEY_TIMEOUT (5s) to allow for retries.
+const initialHandshakeTimeout = 12 * time.Second
 const reconnectInterval = 2 * time.Second // when we're unhealthy, how frequently do we try reconnecting?
 const dialRetryTimeout = 10 * time.Second // how long to retry on ECONNREFUSED
 
@@ -142,7 +140,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	log.Println("Connected...")
 	if !client.WaitForHandshake(initialHandshakeTimeout, ctx) {
-		return fmt.Errorf("connection failed initial handshake after %v", initialHandshakeTimeout)
+		return fmt.Errorf("connection failed initial healthcheck after %v", initialHandshakeTimeout)
 	}
 
 	for {
