@@ -12,10 +12,12 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"time"
 
-	probing "github.com/prometheus-community/pro-bing"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -64,6 +66,19 @@ type Client struct {
 
 	// wgCidr is the current subnet assigned to the WireGuard interface, if any.
 	wgCidr netip.Prefix
+
+	// serverKey is the public key of the server peer, used to locate it among
+	// the interface's peers when reading connection health from the kernel.
+	serverKey wgtypes.Key
+
+	// tunnelSelf and tunnelPeer are our address and the server's address
+	// inside the tunnel.
+	tunnelSelf netip.Addr
+	tunnelPeer netip.Addr
+
+	// Liveness state, reset whenever the peer is reconfigured.
+	lastRxBytes int64
+	probeSeq    int
 }
 
 // CreateInterface creates a new interface for wireguard. DeleteInterface() needs
@@ -112,6 +127,10 @@ func (c *Client) updateInterface(resp connectResponse) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
 	}
+
+	// The vprox server always sits at the first usable address in the subnet.
+	c.tunnelSelf = cidr.Addr()
+	c.tunnelPeer = cidr.Masked().Addr().Next()
 
 	if cidr != c.wgCidr {
 		link := c.link()
@@ -190,6 +209,12 @@ func (c *Client) configureWireguard(connectionResponse connectResponse) error {
 		return fmt.Errorf("failed to parse server public key: %v", err)
 	}
 
+	c.serverKey = serverPublicKey
+
+	// Replacing the peer resets its counters and handshake state, so the
+	// liveness tracking has to start over with it.
+	c.lastRxBytes = 0
+
 	keepalive := 25 * time.Second
 	return c.WgClient.ConfigureDevice(c.Ifname, wgtypes.Config{
 		PrivateKey:   &c.Key,
@@ -267,28 +292,152 @@ func (c *Client) link() *linkWireguard {
 	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: c.Ifname}}
 }
 
-// CheckConnection checks the status of the connection with the wireguard peer,
-// and returns true if it is healthy. This sends 3 pings in succession, and blocks
-// until they receive a response or the timeout passes.
-func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Context) bool {
-	pinger, err := probing.NewPinger(c.wgCidr.Masked().Addr().Next().String())
+// SessionExpiry bounds how stale the last handshake may be before the
+// connection is considered dead.
+//
+// WireGuard refuses to use a session older than REJECT_AFTER_TIME (180s), and
+// a peer with traffic to send rekeys once the session passes REKEY_AFTER_TIME
+// (120s). Because we configure a persistent keepalive there is always traffic
+// to send, so a healthy peer's last handshake never ages much beyond 120s.
+const SessionExpiry = 180 * time.Second
+
+// handshakePollInterval is how often the kernel is polled while waiting for the
+// first handshake to land.
+const handshakePollInterval = 100 * time.Millisecond
+
+// LivenessProbeTimeout is how long to wait for a probe reply before probing
+// again. Replies on an established tunnel arrive in about 100ms, so this leaves
+// several times the headroom needed for a cross-region path.
+const LivenessProbeTimeout = 500 * time.Millisecond
+
+// LivenessFailureThreshold is how many probes in a row must go unanswered
+// before the tunnel is declared dead. Several are required because isolated
+// packet loss must not tear down a working session: reconnecting replaces the
+// peer and discards a perfectly good handshake.
+const LivenessFailureThreshold = 4
+
+// serverPeer returns the kernel's view of the server peer on our interface.
+func (c *Client) serverPeer() (wgtypes.Peer, error) {
+	device, err := c.WgClient.Device(c.Ifname)
 	if err != nil {
-		log.Printf("error creating pinger: %v", err)
+		return wgtypes.Peer{}, fmt.Errorf("failed to read wireguard device %v: %v", c.Ifname, err)
+	}
+	for _, peer := range device.Peers {
+		if peer.PublicKey == c.serverKey {
+			return peer, nil
+		}
+	}
+	return wgtypes.Peer{}, fmt.Errorf("server peer is not configured on %v", c.Ifname)
+}
+
+// CheckConnection reports whether the tunnel is currently carrying traffic.
+//
+// Health comes from the counters the WireGuard kernel module exposes. The
+// server never sends anything unsolicited, though, so a healthy idle tunnel and
+// a tunnel whose peer the server has forgotten look identical until the session
+// ages out around 125s. Rather than wait that out, a tunnel that has gone quiet
+// is probed: each probe is an echo request whose reply is observed as growth in
+// the peer's receive counter, never read from a socket.
+//
+// Any traffic at all satisfies the check, so a busy tunnel is never probed.
+func (c *Client) CheckConnection(cancelCtx context.Context) bool {
+	peer, err := c.serverPeer()
+	if err != nil {
+		log.Printf("healthcheck: %v", err)
 		return false
+	}
+	if peer.LastHandshakeTime.IsZero() {
+		return false
+	}
+	// WireGuard refuses to use a session this old, so no probe could succeed.
+	if time.Since(peer.LastHandshakeTime) > SessionExpiry {
+		return false
+	}
+	if peer.ReceiveBytes > c.lastRxBytes {
+		c.lastRxBytes = peer.ReceiveBytes
+		return true
 	}
 
-	pinger.InterfaceName = c.Ifname
-	pinger.Timeout = timeout
-	pinger.Count = 3
-	pinger.Interval = 10 * time.Millisecond // Send approximately all at once
-	err = pinger.RunWithContext(cancelCtx)  // Blocks until finished.
+	// The tunnel has been quiet since the last check. Establish whether the far
+	// side is still answering before declaring it dead.
+	for i := 0; i < LivenessFailureThreshold; i++ {
+		if err := c.sendLivenessProbe(); err != nil {
+			log.Printf("healthcheck: failed to send liveness probe: %v", err)
+		}
+
+		select {
+		case <-cancelCtx.Done():
+			return false
+		case <-time.After(LivenessProbeTimeout):
+		}
+
+		peer, err := c.serverPeer()
+		if err != nil {
+			log.Printf("healthcheck: %v", err)
+			return false
+		}
+		if peer.ReceiveBytes > c.lastRxBytes {
+			c.lastRxBytes = peer.ReceiveBytes
+			return true
+		}
+	}
+	return false
+}
+
+// sendLivenessProbe emits a single echo request to the server's tunnel address.
+// The reply is never read: it is observed as growth in the peer's receive
+// counter on the next health check, which keeps this non-blocking.
+func (c *Client) sendLivenessProbe() error {
+	if !c.tunnelPeer.IsValid() || !c.tunnelSelf.IsValid() {
+		return fmt.Errorf("tunnel addresses are not configured")
+	}
+
+	conn, err := icmp.ListenPacket("ip4:icmp", c.tunnelSelf.String())
 	if err != nil {
-		log.Printf("error running pinger: %v", err)
-		return false
+		return err
 	}
-	stats := pinger.Statistics()
-	if stats.PacketsRecv > 0 && stats.PacketsRecv < stats.PacketsSent {
-		log.Printf("warning: %v of %v packets in ping were dropped", stats.PacketsSent-stats.PacketsRecv, stats.PacketsSent)
+	defer conn.Close()
+
+	c.probeSeq++
+	msg := icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Body: &icmp.Echo{
+			ID:   os.Getpid() & 0xffff,
+			Seq:  c.probeSeq & 0xffff,
+			Data: []byte("vprox"),
+		},
 	}
-	return stats.PacketsRecv > 0
+	buf, err := msg.Marshal(nil)
+	if err != nil {
+		return err
+	}
+	_, err = conn.WriteTo(buf, &net.IPAddr{IP: net.IP(c.tunnelPeer.AsSlice())})
+	return err
+}
+
+// WaitForHandshake blocks until the tunnel completes its first handshake, the
+// timeout expires, or the context is cancelled.
+//
+// A handshake initiation that is lost in transit is not retried by WireGuard
+// until REKEY_TIMEOUT (5s), so the timeout must span several of those retries
+// for a single dropped packet not to fail the connection.
+func (c *Client) WaitForHandshake(timeout time.Duration, cancelCtx context.Context) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		peer, err := c.serverPeer()
+		if err != nil {
+			log.Printf("waiting for handshake: %v", err)
+		} else if !peer.LastHandshakeTime.IsZero() {
+			return true
+		}
+
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-cancelCtx.Done():
+			return false
+		case <-time.After(handshakePollInterval):
+		}
+	}
 }

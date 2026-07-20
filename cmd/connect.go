@@ -23,9 +23,13 @@ import (
 // (note that this dosen't include the time spent checking)
 const healthCheckInterval = 2 * time.Second
 
-const healthCheckTimeout = 5 * time.Second // how long do we wait before the health check times out?
-const reconnectInterval = 2 * time.Second  // when we're unhealthy, how frequently do we try reconnecting?
-const dialRetryTimeout = 10 * time.Second  // how long to retry on ECONNREFUSED
+// how long do we wait for the tunnel's first handshake before giving up?
+// this spans several of WireGuard's REKEY_TIMEOUT (5s) handshake retries, so
+// that a single dropped handshake packet doesn't fail the connection.
+const initialHandshakeTimeout = 20 * time.Second
+
+const reconnectInterval = 2 * time.Second // when we're unhealthy, how frequently do we try reconnecting?
+const dialRetryTimeout = 10 * time.Second // how long to retry on ECONNREFUSED
 
 // dialWithRetry retries TCP connections on ECONNREFUSED up to dialRetryTimeout.
 func dialWithRetry(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -137,8 +141,8 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}()
 
 	log.Println("Connected...")
-	if !client.CheckConnection(healthCheckTimeout, ctx) {
-		return fmt.Errorf("connection failed initial healthcheck after %v", healthCheckTimeout)
+	if !client.WaitForHandshake(initialHandshakeTimeout, ctx) {
+		return fmt.Errorf("connection failed initial handshake after %v", initialHandshakeTimeout)
 	}
 
 	for {
@@ -150,7 +154,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		case <-time.After(healthCheckInterval):
 		}
 
-		currentStatus := client.CheckConnection(healthCheckTimeout, ctx)
+		currentStatus := client.CheckConnection(ctx)
 
 		if !currentStatus {
 			log.Println("No longer connected. Attempting to reconnect...")
@@ -159,13 +163,21 @@ func runConnect(cmd *cobra.Command, args []string) error {
 				// currently in an unhealthy state
 				err = client.Connect()
 				if err == nil {
-					log.Println("Reconnected...")
-					break unhealthy_loop
+					// Reconfiguring the peer clears its handshake state, so wait
+					// for the new session to come up before declaring the tunnel
+					// healthy. Reconnecting again here would tear down a handshake
+					// that is still in flight.
+					if client.WaitForHandshake(initialHandshakeTimeout, ctx) {
+						log.Println("Reconnected...")
+						break unhealthy_loop
+					}
+					log.Printf("Reconnected to server, but no handshake within %v", initialHandshakeTimeout)
+				} else {
+					if !lib.IsRecoverableError(err) {
+						return fmt.Errorf("unrecoverable connection error: %w", err)
+					}
+					log.Printf("Failed to reconnect: %v", err)
 				}
-				if !lib.IsRecoverableError(err) {
-					return fmt.Errorf("unrecoverable connection error: %w", err)
-				}
-				log.Printf("Failed to reconnect: %v", err)
 				select {
 				case <-ctx.Done():
 					log.Println("Context is Done; received SIGINT or SIGTERM. Breaking out of unhealthy_loop.")
