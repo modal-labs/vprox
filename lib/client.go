@@ -112,6 +112,11 @@ func (c *Client) Connect(cancelCtx context.Context) error {
 	// Configuring the peer discards any session it already had, so the tunnel
 	// carries nothing until a new handshake completes.
 	if !c.waitForHandshake(cancelCtx) {
+		// The server is holding a peer and a subnet IP for us. Hand them back
+		// now rather than leaving them to the idle timeout.
+		if err := c.Disconnect(); err != nil {
+			log.Printf("warning: failed to disconnect after handshake timed out: %v", err)
+		}
 		return fmt.Errorf("no handshake with server within %v", handshakeTimeout)
 	}
 
