@@ -23,9 +23,6 @@ import (
 // (note that this dosen't include the time spent checking)
 const healthCheckInterval = 2 * time.Second
 
-// how long do we wait for the tunnel's first handshake before giving up?
-// Keep this higher than WireGuard's REKEY_TIMEOUT (5s) to allow for retries.
-const initialHandshakeTimeout = 12 * time.Second
 const reconnectInterval = 2 * time.Second // when we're unhealthy, how frequently do we try reconnecting?
 const dialRetryTimeout = 10 * time.Second // how long to retry on ECONNREFUSED
 
@@ -126,7 +123,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}
 	defer client.DeleteInterface()
 
-	err = client.Connect()
+	err = client.Connect(ctx)
 	if err != nil {
 		return err
 	}
@@ -139,9 +136,6 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}()
 
 	log.Println("Connected...")
-	if !client.WaitForHandshake(initialHandshakeTimeout, ctx) {
-		return fmt.Errorf("connection failed initial healthcheck after %v", initialHandshakeTimeout)
-	}
 
 	for {
 		// currently in a healthy state
@@ -159,23 +153,15 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		unhealthy_loop:
 			for {
 				// currently in an unhealthy state
-				err = client.Connect()
+				err = client.Connect(ctx)
 				if err == nil {
-					// Reconfiguring the peer clears its handshake state, so wait
-					// for the new session to come up before declaring the tunnel
-					// healthy. Reconnecting again here would tear down a handshake
-					// that is still in flight.
-					if client.WaitForHandshake(initialHandshakeTimeout, ctx) {
-						log.Println("Reconnected...")
-						break unhealthy_loop
-					}
-					log.Printf("Reconnected to server, but no handshake within %v", initialHandshakeTimeout)
-				} else {
-					if !lib.IsRecoverableError(err) {
-						return fmt.Errorf("unrecoverable connection error: %w", err)
-					}
-					log.Printf("Failed to reconnect: %v", err)
+					log.Println("Reconnected...")
+					break unhealthy_loop
 				}
+				if !lib.IsRecoverableError(err) {
+					return fmt.Errorf("unrecoverable connection error: %w", err)
+				}
+				log.Printf("Failed to reconnect: %v", err)
 				select {
 				case <-ctx.Done():
 					log.Println("Context is Done; received SIGINT or SIGTERM. Breaking out of unhealthy_loop.")

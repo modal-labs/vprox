@@ -83,9 +83,11 @@ func (c *Client) CreateInterface() error {
 	return nil
 }
 
-// Connect attempts to reconnect to the peer. A network interface needs to
-// have already been created with CreateInterface() before calling Connect()
-func (c *Client) Connect() error {
+// Connect attempts to (re)connect to the peer. A network interface needs to
+// have already been created with CreateInterface() before calling Connect().
+//
+// This returns after the WireGuard tunnel handshake is complete.
+func (c *Client) Connect(cancelCtx context.Context) error {
 	resp, err := c.sendConnectionRequest()
 	if err != nil {
 		return err
@@ -105,6 +107,12 @@ func (c *Client) Connect() error {
 	err = c.configureWireguard(resp)
 	if err != nil {
 		return fmt.Errorf("error configuring wireguard interface: %v", err)
+	}
+
+	// Configuring the peer discards any session it already had, so the tunnel
+	// carries nothing until a new handshake completes.
+	if !c.waitForHandshake(cancelCtx) {
+		return fmt.Errorf("no handshake with server within %v", handshakeTimeout)
 	}
 
 	return nil
@@ -275,14 +283,19 @@ func (c *Client) link() *linkWireguard {
 	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: c.Ifname}}
 }
 
-// Tunnel health is judged against WireGuard's own timers. A peer with traffic
-// to send, which the persistent keepalive guarantees, rekeys at
-// REKEY_AFTER_TIME (120s), so a healthy handshake never ages far beyond that.
 const (
-	SessionExpiry            = 180 * time.Second      // REJECT_AFTER_TIME
-	LivenessProbeTimeout     = 500 * time.Millisecond // replies arrive in ~100ms
-	LivenessFailureThreshold = 4                      // one lost packet must not force a reconnect
-	handshakePollInterval    = 100 * time.Millisecond
+	// WireGuard refuses to use a session older than REJECT_AFTER_TIME=180s.
+	// A last handshake time older than this means the tunnel is closed.
+	sessionExpiry = 180 * time.Second
+	// How long to wait before checking whether a liveness probe was answered.
+	// Replies on an established tunnel arrive in about 100ms.
+	livenessProbeResponseWait = 500 * time.Millisecond
+	// How many unanswered probes to tolerate before declaring the tunnel dead.
+	livenessFailureThreshold = 4
+	// How long to wait for the tunnel's first handshake. This should be higher
+	// than the REKEY_TIMEOUT=5s that WireGuard uses to retry handshakes.
+	handshakeTimeout      = 12 * time.Second
+	handshakePollInterval = 100 * time.Millisecond
 )
 
 // serverPeer returns the kernel's view of the server, the interface's only peer.
@@ -297,11 +310,8 @@ func (c *Client) serverPeer() (wgtypes.Peer, error) {
 	return device.Peers[0], nil
 }
 
-// CheckConnection reports whether the tunnel is carrying traffic, using the
-// counters the WireGuard kernel module exposes. The server sends nothing
-// unsolicited, so a healthy idle tunnel is indistinguishable from one whose
-// peer it has forgotten until the session ages out around 125s; a tunnel that
-// has gone quiet is therefore probed rather than waited out.
+// CheckConnection reports whether the tunnel is carrying traffic, judged from
+// the counters the WireGuard kernel module exposes.
 func (c *Client) CheckConnection(cancelCtx context.Context) bool {
 	peer, err := c.serverPeer()
 	if err != nil {
@@ -312,7 +322,7 @@ func (c *Client) CheckConnection(cancelCtx context.Context) bool {
 		return false
 	}
 	// No probe could succeed once WireGuard refuses to use the session.
-	if time.Since(peer.LastHandshakeTime) > SessionExpiry {
+	if time.Since(peer.LastHandshakeTime) > sessionExpiry {
 		return false
 	}
 	// Any traffic at all proves the tunnel works, so a busy one is never probed.
@@ -321,15 +331,17 @@ func (c *Client) CheckConnection(cancelCtx context.Context) bool {
 		return true
 	}
 
-	for i := 0; i < LivenessFailureThreshold; i++ {
-		if err := c.sendLivenessProbe(); err != nil {
+	// The server doesn't send any keepalives, so zero rx bytes might just mean an
+	// idle tunnel. We probe to confirm/deny this.
+	for i := 0; i < livenessFailureThreshold; i++ {
+		if err := c.fireAndForgetLivenessProbe(); err != nil {
 			log.Printf("healthcheck: failed to send liveness probe: %v", err)
 		}
 
 		select {
 		case <-cancelCtx.Done():
 			return false
-		case <-time.After(LivenessProbeTimeout):
+		case <-time.After(livenessProbeResponseWait):
 		}
 
 		peer, err := c.serverPeer()
@@ -345,9 +357,9 @@ func (c *Client) CheckConnection(cancelCtx context.Context) bool {
 	return false
 }
 
-// sendLivenessProbe emits one echo request to the server's tunnel address. The
-// reply is never read; it is observed as growth in the peer's receive counter.
-func (c *Client) sendLivenessProbe() error {
+// fireAndForgetLivenessProbe emits one echo request to the server's tunnel
+// address, returning immediately. This should trigger rxBytes growth on reply.
+func (c *Client) fireAndForgetLivenessProbe() error {
 	if !c.wgCidr.IsValid() {
 		return fmt.Errorf("no address is assigned to %v", c.Ifname)
 	}
@@ -372,12 +384,10 @@ func (c *Client) sendLivenessProbe() error {
 	return err
 }
 
-// WaitForHandshake blocks until the tunnel completes its first handshake, the
-// timeout expires, or the context is cancelled. WireGuard does not retry a lost
-// handshake initiation until REKEY_TIMEOUT (5s), so the timeout must span
-// several of those retries for one dropped packet not to fail the connection.
-func (c *Client) WaitForHandshake(timeout time.Duration, cancelCtx context.Context) bool {
-	deadline := time.Now().Add(timeout)
+// waitForHandshake blocks until the tunnel completes a handshake, the timeout
+// expires, or the context is cancelled.
+func (c *Client) waitForHandshake(cancelCtx context.Context) bool {
+	deadline := time.Now().Add(handshakeTimeout)
 	for {
 		peer, err := c.serverPeer()
 		if err != nil {
