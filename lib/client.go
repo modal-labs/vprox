@@ -12,11 +12,13 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -371,7 +373,20 @@ func (c *Client) fireAndForgetLivenessProbe() error {
 	// The vprox server always sits at the first usable address in the subnet.
 	peerAddr := c.wgCidr.Masked().Addr().Next()
 
-	conn, err := icmp.ListenPacket("ip4:icmp", c.wgCidr.Addr().String())
+	// Since a host can hold several tunnels to the same server, we need this
+	// ping to unambiguously identify the tunnel we're measuring by interface.
+	lc := net.ListenConfig{
+		Control: func(_, _ string, rawConn syscall.RawConn) error {
+			var sockErr error
+			if err := rawConn.Control(func(fd uintptr) {
+				sockErr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, c.Ifname)
+			}); err != nil {
+				return err
+			}
+			return sockErr
+		},
+	}
+	conn, err := lc.ListenPacket(context.Background(), "ip4:icmp", c.wgCidr.Addr().String())
 	if err != nil {
 		return err
 	}
