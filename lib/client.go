@@ -296,7 +296,7 @@ const (
 	// Replies on an established tunnel arrive in about 100ms.
 	livenessProbeResponseWait = 500 * time.Millisecond
 	// How many unanswered probes to tolerate before declaring the tunnel dead.
-	livenessFailureThreshold = 4
+	livenessFailureThreshold = 10
 	// How long to wait for the tunnel's first handshake. This should be higher
 	// than the REKEY_TIMEOUT=5s that WireGuard uses to retry handshakes.
 	handshakeTimeout      = 12 * time.Second
