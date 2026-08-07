@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"time"
 
-	probing "github.com/prometheus-community/pro-bing"
 	"github.com/vishvananda/netlink"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -64,6 +63,9 @@ type Client struct {
 
 	// wgCidr is the current subnet assigned to the WireGuard interface, if any.
 	wgCidr netip.Prefix
+
+	// lastRxBytes is the peer's receive counter as of the last health check.
+	lastRxBytes int64
 }
 
 // CreateInterface creates a new interface for wireguard. DeleteInterface() needs
@@ -190,6 +192,9 @@ func (c *Client) configureWireguard(connectionResponse connectResponse) error {
 		return fmt.Errorf("failed to parse server public key: %v", err)
 	}
 
+	// Replacing the peer resets its counters, so liveness tracking starts over.
+	c.lastRxBytes = 0
+
 	keepalive := 25 * time.Second
 	return c.WgClient.ConfigureDevice(c.Ifname, wgtypes.Config{
 		PrivateKey:   &c.Key,
@@ -267,28 +272,45 @@ func (c *Client) link() *linkWireguard {
 	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: c.Ifname}}
 }
 
-// CheckConnection checks the status of the connection with the wireguard peer,
-// and returns true if it is healthy. This sends 3 pings in succession, and blocks
-// until they receive a response or the timeout passes.
-func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Context) bool {
-	pinger, err := probing.NewPinger(c.wgCidr.Masked().Addr().Next().String())
-	if err != nil {
-		log.Printf("error creating pinger: %v", err)
-		return false
-	}
+// How often the peer's receive counter is sampled while waiting for it to move.
+const livenessPollInterval = 250 * time.Millisecond
 
-	pinger.InterfaceName = c.Ifname
-	pinger.Timeout = timeout
-	pinger.Count = 3
-	pinger.Interval = 10 * time.Millisecond // Send approximately all at once
-	err = pinger.RunWithContext(cancelCtx)  // Blocks until finished.
+// serverPeer returns the kernel's view of the server, the interface's only peer.
+func (c *Client) serverPeer() (wgtypes.Peer, error) {
+	device, err := c.WgClient.Device(c.Ifname)
 	if err != nil {
-		log.Printf("error running pinger: %v", err)
-		return false
+		return wgtypes.Peer{}, fmt.Errorf("failed to read wireguard device %v: %v", c.Ifname, err)
 	}
-	stats := pinger.Statistics()
-	if stats.PacketsRecv > 0 && stats.PacketsRecv < stats.PacketsSent {
-		log.Printf("warning: %v of %v packets in ping were dropped", stats.PacketsSent-stats.PacketsRecv, stats.PacketsSent)
+	if len(device.Peers) != 1 {
+		return wgtypes.Peer{}, fmt.Errorf("expected one peer on %v, found %v", c.Ifname, len(device.Peers))
 	}
-	return stats.PacketsRecv > 0
+	return device.Peers[0], nil
+}
+
+// CheckConnection checks the status of the connection with the wireguard peer,
+// and returns true if it is healthy. The server keepalives the tunnel, so a
+// live one always moves its receive counter; this blocks until the counter
+// moves or the timeout passes, and sends nothing itself.
+func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Context) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		peer, err := c.serverPeer()
+		if err != nil {
+			log.Printf("error checking connection: %v", err)
+			return false
+		}
+		if !peer.LastHandshakeTime.IsZero() && peer.ReceiveBytes > c.lastRxBytes {
+			c.lastRxBytes = peer.ReceiveBytes
+			return true
+		}
+
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-cancelCtx.Done():
+			return false
+		case <-time.After(livenessPollInterval):
+		}
+	}
 }
