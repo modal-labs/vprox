@@ -40,6 +40,14 @@ const FirstHandshakeTimeout = 10 * time.Second
 // setting.
 const PeerIdleTimeout = 5 * time.Minute
 
+// Keepalives the server sends down each tunnel. They give the client a signal
+// it can observe without sending anything itself: an idle but healthy tunnel
+// grows its receive counter, and one the server has forgotten does not.
+//
+// wgctrl encodes this as whole seconds, so a sub-second value truncates to
+// zero and silently disables keepalives entirely.
+var serverKeepalive = 1 * time.Second
+
 type PeerInfo struct {
 	ConnectionTime time.Time
 	PeerIp         netip.Addr
@@ -136,7 +144,10 @@ func (srv *Server) initStateFromWireguard() error {
 	}
 
 	srv.mu.Lock()
-	defer srv.mu.Unlock()
+
+	// Peers configured by a previous server instance predate keepalives, and a
+	// healthy tunnel never reconnects on its own to pick them up.
+	var keepaliveBackfill []wgtypes.PeerConfig
 
 	for _, peer := range device.Peers {
 		if len(peer.AllowedIPs) == 0 {
@@ -159,10 +170,30 @@ func (srv *Server) initStateFromWireguard() error {
 			PeerIp:         peerIp,
 		}
 
+		if peer.PersistentKeepaliveInterval != serverKeepalive {
+			keepaliveBackfill = append(keepaliveBackfill, wgtypes.PeerConfig{
+				PublicKey:                   peer.PublicKey,
+				UpdateOnly:                  true,
+				PersistentKeepaliveInterval: &serverKeepalive,
+			})
+		}
+
 		log.Printf("[%v] takeover: inherited peer %v at %v", srv.BindAddr, peer.PublicKey, peerIp)
 	}
 
 	log.Printf("[%v] takeover: inherited %d peers from WireGuard state", srv.BindAddr, len(srv.allPeers))
+	srv.mu.Unlock()
+
+	if len(keepaliveBackfill) > 0 {
+		tWg := time.Now()
+		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: keepaliveBackfill})
+		MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:backfill_keepalive")
+		if err != nil {
+			return fmt.Errorf("failed to set keepalive on inherited peers: %v", err)
+		}
+		log.Printf("[%v] takeover: set keepalive on %d inherited peers", srv.BindAddr, len(keepaliveBackfill))
+	}
+
 	return nil
 }
 
@@ -249,9 +280,10 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{
 			{
-				PublicKey:         peerKey,
-				ReplaceAllowedIPs: true,
-				AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
+				PublicKey:                   peerKey,
+				ReplaceAllowedIPs:           true,
+				AllowedIPs:                  []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
+				PersistentKeepaliveInterval: &serverKeepalive,
 			},
 		},
 	})
