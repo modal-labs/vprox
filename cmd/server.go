@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/netip"
 	"os/signal"
 	"strconv"
@@ -196,7 +197,7 @@ func pollAwsLoop(ctx context.Context, sm *lib.ServerManager, initialIps ipSet) {
 			var err error
 			currentIps, err = pollAws(awsClient, currentIps, sm)
 			if err != nil {
-				fmt.Printf("error during aws poll: %v", err)
+				log.Printf("error during aws poll: %v", err)
 			}
 		}
 	}
