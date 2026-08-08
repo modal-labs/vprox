@@ -665,9 +665,10 @@ func (srv *Server) removeIdlePeers() error {
 	var removePeers []wgtypes.PeerConfig
 	var removeIps []netip.Addr
 	for _, peer := range device.Peers {
+		peerInfo, exists := srv.allPeers[peer.PublicKey]
+
 		var idle bool
 		if peer.LastHandshakeTime.IsZero() {
-			peerInfo, exists := srv.allPeers[peer.PublicKey]
 			if exists {
 				idle = time.Since(peerInfo.ConnectionTime) > PeerIdleTimeout
 			} else {
@@ -679,20 +680,30 @@ func (srv *Server) removeIdlePeers() error {
 			idle = time.Since(peer.LastHandshakeTime) > PeerIdleTimeout
 		}
 
-		if idle {
-			if len(peer.AllowedIPs) > 0 {
-				ipv4 := peer.AllowedIPs[0].IP.To4()
-				if ipv4 != nil {
-					log.Printf("[%v] removing idle peer at %v: %v",
-						srv.BindAddr, ipv4, peer.PublicKey)
-					removeIps = append(removeIps, netip.AddrFrom4([4]byte(ipv4)))
-				}
-			}
-			removePeers = append(removePeers, wgtypes.PeerConfig{
-				PublicKey: peer.PublicKey,
-				Remove:    true,
-			})
+		if !idle {
+			continue
+		}
+
+		removePeers = append(removePeers, wgtypes.PeerConfig{
+			PublicKey: peer.PublicKey,
+			Remove:    true,
+		})
+
+		// Only free the IP if allPeers still owns this peer. If the entry is
+		// absent, another path (e.g. a concurrent /disconnect via cleanupPeer)
+		// already removed it and is responsible for freeing the IP. Freeing
+		// here off the WireGuard AllowedIPs snapshot would risk freeing an IP
+		// that has since been reallocated to a new peer.
+		if exists {
+			log.Printf("[%v] removing idle peer at %v: %v",
+				srv.BindAddr, peerInfo.PeerIp, peer.PublicKey)
 			delete(srv.allPeers, peer.PublicKey)
+			if !peerInfo.PeerIp.IsUnspecified() {
+				removeIps = append(removeIps, peerInfo.PeerIp)
+			}
+		} else {
+			log.Printf("[%v] removing idle peer with no allPeers entry: %v",
+				srv.BindAddr, peer.PublicKey)
 		}
 	}
 
