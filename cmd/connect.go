@@ -31,9 +31,8 @@ const dialRetryTimeout = 10 * time.Second  // how long to retry on ECONNREFUSED
 // until one succeeds or the deadline is exceeded. Returns true
 // if any healthcheck succeeds, and false otherwise.
 func waitForHealthyConnection(client *lib.Client, ctx context.Context) bool {
-	// How long we retry failed healthchecks before declaring the connection unhealthy.
-	const healthCheckRetryPeriod = 20 * time.Second
-	deadline := time.Now().Add(healthCheckRetryPeriod)
+	// Retry failed healthchecks for up to 20s before declaring the connection unhealthy.
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		// Cap the timeout so a single healthcheck never runs past the deadline.
 		timeout := min(healthCheckTimeout, time.Until(deadline))
