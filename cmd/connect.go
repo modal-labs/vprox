@@ -34,7 +34,6 @@ func waitForHealthyConnection(client *lib.Client, ctx context.Context) bool {
 	// Retry failed healthchecks for up to 20s before declaring the connection unhealthy.
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		// Cap the timeout so a single healthcheck never runs past the deadline.
 		timeout := min(healthCheckTimeout, time.Until(deadline))
 		if client.CheckConnection(timeout, ctx) {
 			return true
