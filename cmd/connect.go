@@ -27,7 +27,7 @@ const healthCheckTimeout = 5 * time.Second // how long do we wait before a singl
 const reconnectInterval = 2 * time.Second  // when we're unhealthy, how frequently do we try reconnecting?
 const dialRetryTimeout = 10 * time.Second  // how long to retry on ECONNREFUSED
 
-// waitForHealthyConnection sends pings to the vprox server as healthchecks
+// waitForHealthyConnection sends pings to the vprox server over the wireguard tunnel
 // until one succeeds or the deadline is exceeded. Returns true
 // if any healthcheck succeeds, and false otherwise.
 func waitForHealthyConnection(client *lib.Client, ctx context.Context) bool {
