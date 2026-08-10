@@ -23,22 +23,22 @@ import (
 // (note that this dosen't include the time spent checking)
 const healthCheckInterval = 2 * time.Second
 
-const healthCheckTimeout = 5 * time.Second      // how long do we wait before a single health check times out?
-const healthCheckRetryPeriod = 20 * time.Second // how long do we retry failed health checks before declaring the connection unhealthy?
-const reconnectInterval = 2 * time.Second       // when we're unhealthy, how frequently do we try reconnecting?
-const dialRetryTimeout = 10 * time.Second       // how long to retry on ECONNREFUSED
+const healthCheckTimeout = 5 * time.Second // how long do we wait before a single health check times out?
+const reconnectInterval = 2 * time.Second  // when we're unhealthy, how frequently do we try reconnecting?
+const dialRetryTimeout = 10 * time.Second  // how long to retry on ECONNREFUSED
 
-// checkConnectionWithRetry retries the health check until it succeeds or
-// healthCheckRetryPeriod has elapsed. Returns false if all attempts fail or
-// the context is canceled.
-func checkConnectionWithRetry(client *lib.Client, ctx context.Context) bool {
+// waitForHealthyConnection sends pings to the vprox server as healthchecks
+// until one succeeds or the deadline is exceeded. Returns true
+// if any healthcheck succeeds, and false otherwise.
+func waitForHealthyConnection(client *lib.Client, ctx context.Context) bool {
+	// How long we retry failed healthchecks before declaring the connection unhealthy.
+	const healthCheckRetryPeriod = 20 * time.Second
 	deadline := time.Now().Add(healthCheckRetryPeriod)
-	for {
-		if client.CheckConnection(healthCheckTimeout, ctx) {
+	for time.Now().Before(deadline) {
+		// Cap the timeout so a single healthcheck never runs past the deadline.
+		timeout := min(healthCheckTimeout, time.Until(deadline))
+		if client.CheckConnection(timeout, ctx) {
 			return true
-		}
-		if !time.Now().Before(deadline) {
-			return false
 		}
 		log.Printf("health check failed, retrying...")
 		select {
@@ -47,6 +47,8 @@ func checkConnectionWithRetry(client *lib.Client, ctx context.Context) bool {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+	// We exceeded the deadline without finding a healthy connection.
+	return false
 }
 
 // dialWithRetry retries TCP connections on ECONNREFUSED up to dialRetryTimeout.
@@ -159,8 +161,8 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}()
 
 	log.Println("Connected...")
-	if !checkConnectionWithRetry(client, ctx) {
-		return fmt.Errorf("connection failed initial healthcheck after %v", healthCheckRetryPeriod)
+	if !waitForHealthyConnection(client, ctx) {
+		return fmt.Errorf("connection failed initial healthcheck")
 	}
 
 	for {
@@ -172,7 +174,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		case <-time.After(healthCheckInterval):
 		}
 
-		currentStatus := checkConnectionWithRetry(client, ctx)
+		currentStatus := client.CheckConnection(healthCheckTimeout, ctx)
 
 		if !currentStatus {
 			log.Println("No longer connected. Attempting to reconnect...")
