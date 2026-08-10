@@ -23,19 +23,18 @@ import (
 // (note that this dosen't include the time spent checking)
 const healthCheckInterval = 2 * time.Second
 
-const healthCheckTimeout = 5 * time.Second // how long do we wait before a single health check times out?
-const reconnectInterval = 2 * time.Second  // when we're unhealthy, how frequently do we try reconnecting?
-const dialRetryTimeout = 10 * time.Second  // how long to retry on ECONNREFUSED
+const reconnectInterval = 2 * time.Second // when we're unhealthy, how frequently do we try reconnecting?
+const dialRetryTimeout = 10 * time.Second // how long to retry on ECONNREFUSED
 
 // waitForHealthyConnection sends pings to the vprox server over the wireguard tunnel
 // until one succeeds or the deadline is exceeded. Returns true
 // if any healthcheck succeeds, and false otherwise.
-func waitForHealthyConnection(client *lib.Client, ctx context.Context) bool {
+func waitForHealthyConnection(ctx context.Context, client *lib.Client) bool {
 	// Retry failed healthchecks for up to 20s before declaring the connection unhealthy.
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		timeout := min(healthCheckTimeout, time.Until(deadline))
-		if client.CheckConnection(timeout, ctx) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	for {
+		if client.CheckConnection(ctx) {
 			return true
 		}
 		log.Printf("health check failed, retrying...")
@@ -45,8 +44,6 @@ func waitForHealthyConnection(client *lib.Client, ctx context.Context) bool {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	// We exceeded the deadline without finding a healthy connection.
-	return false
 }
 
 // dialWithRetry retries TCP connections on ECONNREFUSED up to dialRetryTimeout.
@@ -159,7 +156,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}()
 
 	log.Println("Connected...")
-	if !waitForHealthyConnection(client, ctx) {
+	if !waitForHealthyConnection(ctx, client) {
 		return fmt.Errorf("connection failed initial healthcheck")
 	}
 
@@ -172,7 +169,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		case <-time.After(healthCheckInterval):
 		}
 
-		currentStatus := client.CheckConnection(healthCheckTimeout, ctx)
+		currentStatus := client.CheckConnection(ctx)
 
 		if !currentStatus {
 			log.Println("No longer connected. Attempting to reconnect...")
