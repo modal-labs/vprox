@@ -23,9 +23,31 @@ import (
 // (note that this dosen't include the time spent checking)
 const healthCheckInterval = 2 * time.Second
 
-const healthCheckTimeout = 5 * time.Second // how long do we wait before the health check times out?
-const reconnectInterval = 2 * time.Second  // when we're unhealthy, how frequently do we try reconnecting?
-const dialRetryTimeout = 10 * time.Second  // how long to retry on ECONNREFUSED
+const healthCheckTimeout = 5 * time.Second      // how long do we wait before a single health check times out?
+const healthCheckRetryPeriod = 20 * time.Second // how long do we retry failed health checks before declaring the connection unhealthy?
+const reconnectInterval = 2 * time.Second       // when we're unhealthy, how frequently do we try reconnecting?
+const dialRetryTimeout = 10 * time.Second       // how long to retry on ECONNREFUSED
+
+// checkConnectionWithRetry retries the health check until it succeeds or
+// healthCheckRetryPeriod has elapsed. Returns false if all attempts fail or
+// the context is canceled.
+func checkConnectionWithRetry(client *lib.Client, ctx context.Context) bool {
+	deadline := time.Now().Add(healthCheckRetryPeriod)
+	for {
+		if client.CheckConnection(healthCheckTimeout, ctx) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		log.Printf("health check failed, retrying...")
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
 
 // dialWithRetry retries TCP connections on ECONNREFUSED up to dialRetryTimeout.
 func dialWithRetry(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -137,8 +159,8 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}()
 
 	log.Println("Connected...")
-	if !client.CheckConnection(healthCheckTimeout, ctx) {
-		return fmt.Errorf("connection failed initial healthcheck after %v", healthCheckTimeout)
+	if !checkConnectionWithRetry(client, ctx) {
+		return fmt.Errorf("connection failed initial healthcheck after %v", healthCheckRetryPeriod)
 	}
 
 	for {
@@ -150,7 +172,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		case <-time.After(healthCheckInterval):
 		}
 
-		currentStatus := client.CheckConnection(healthCheckTimeout, ctx)
+		currentStatus := checkConnectionWithRetry(client, ctx)
 
 		if !currentStatus {
 			log.Println("No longer connected. Attempting to reconnect...")
