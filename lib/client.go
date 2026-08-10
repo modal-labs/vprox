@@ -267,13 +267,10 @@ func (c *Client) link() *linkWireguard {
 	return &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: c.Ifname}}
 }
 
-// How long a single connection check waits for ping responses before giving up.
-const checkConnectionTimeout = 5 * time.Second
-
 // CheckConnection checks the status of the connection with the wireguard peer,
 // and returns true if it is healthy. This sends 3 pings in succession, and blocks
-// until they receive a response, the timeout passes, or ctx is canceled.
-func (c *Client) CheckConnection(ctx context.Context) bool {
+// until they receive a response or the timeout passes.
+func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Context) bool {
 	pinger, err := probing.NewPinger(c.wgCidr.Masked().Addr().Next().String())
 	if err != nil {
 		log.Printf("error creating pinger: %v", err)
@@ -281,10 +278,10 @@ func (c *Client) CheckConnection(ctx context.Context) bool {
 	}
 
 	pinger.InterfaceName = c.Ifname
-	pinger.Timeout = checkConnectionTimeout
+	pinger.Timeout = timeout
 	pinger.Count = 3
 	pinger.Interval = 10 * time.Millisecond // Send approximately all at once
-	err = pinger.RunWithContext(ctx)        // Blocks until finished.
+	err = pinger.RunWithContext(cancelCtx)  // Blocks until finished.
 	if err != nil {
 		log.Printf("error running pinger: %v", err)
 		return false
