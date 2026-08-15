@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -761,6 +762,11 @@ func (srv *Server) ListenForHttps() error {
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		},
+		// The control plane listens on the public internet, so its :443 socket
+		// is constantly hit by port scanners and bots. Their failed TLS
+		// handshakes and malformed HTTP/2 prefaces would otherwise be logged as
+		// errors by net/http's default logger. Filter that noise out here.
+		ErrorLog: log.New(scannerNoiseFilter{}, "", log.LstdFlags),
 	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("%v:443", srv.BindAddr))
@@ -786,6 +792,30 @@ func (srv *Server) ListenForHttps() error {
 	case err = <-errCh:
 		return err
 	}
+}
+
+// scannerNoiseSubstrings are markers of net/http server error-log lines that
+// are produced by internet scanners rather than real server faults. They are
+// dropped by scannerNoiseFilter.
+var scannerNoiseSubstrings = []string{
+	// e.g. "http: TLS handshake error from 1.2.3.4:5678: ..."
+	"TLS handshake error",
+	// e.g. "http2: server: error reading preface from client 1.2.3.4:5678: ..."
+	"error reading preface from client",
+}
+
+// scannerNoiseFilter is an io.Writer for http.Server.ErrorLog that discards
+// scanner-generated noise (see scannerNoiseSubstrings) and forwards everything
+// else to stderr, matching the default net/http logging destination.
+type scannerNoiseFilter struct{}
+
+func (scannerNoiseFilter) Write(p []byte) (int, error) {
+	for _, s := range scannerNoiseSubstrings {
+		if strings.Contains(string(p), s) {
+			return len(p), nil
+		}
+	}
+	return os.Stderr.Write(p)
 }
 
 //go:embed certs/cert.pem certs/key.pem
