@@ -14,7 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/modal-labs/vprox/lib"
-	"github.com/modal-labs/vprox/rawclient"
+	client "github.com/modal-labs/vprox/rawclient"
 )
 
 // ConnectRawCmd is a wgctrl-free variant of ConnectCmd, built on the
@@ -44,7 +44,7 @@ func waitForHealthyConnectionRaw(ctx context.Context, ifname string, wgCidr neti
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	for {
-		if rawclient.CheckConnection(ifname, wgCidr, healthCheckTimeout, ctx) {
+		if client.CheckConnection(ifname, wgCidr, healthCheckTimeout, ctx) {
 			return true
 		}
 		log.Printf("health check failed, retrying...")
@@ -64,7 +64,7 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 
 	ifname := connectRawCmdArgs.ifname
 
-	key, err := rawclient.LoadOrGenerateClientKey(ifname)
+	key, err := client.LoadOrGenerateClientKey(ifname)
 	if err != nil {
 		return fmt.Errorf("failed to load client key: %v", err)
 	}
@@ -88,20 +88,20 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer done()
 
-	if err = rawclient.CreateInterface(ifname); err != nil {
+	if err = client.CreateInterface(ifname); err != nil {
 		return err
 	}
-	defer rawclient.DeleteInterface(ifname)
+	defer client.DeleteInterface(ifname)
 
 	var wgCidr netip.Prefix
-	wgCidr, err = rawclient.Connect(httpClient, serverIp, token, key, ifname, wgCidr)
+	wgCidr, err = client.Connect(httpClient, serverIp, token, key, ifname, wgCidr)
 	if err != nil {
 		return err
 	}
 	// Notify the server when we disconnect so it can reclaim resources immediately.
 	defer func() {
 		log.Println("About send /disconnect request to server.")
-		if err := rawclient.Disconnect(httpClient, serverIp, token, key); err != nil {
+		if err := client.Disconnect(httpClient, serverIp, token, key); err != nil {
 			log.Printf("warning: failed to disconnect from server: %v", err)
 		}
 	}()
@@ -120,19 +120,19 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 		case <-time.After(healthCheckInterval):
 		}
 
-		currentStatus := rawclient.CheckConnection(ifname, wgCidr, healthCheckTimeout, ctx)
+		currentStatus := client.CheckConnection(ifname, wgCidr, healthCheckTimeout, ctx)
 
 		if !currentStatus {
 			log.Println("No longer connected. Attempting to reconnect...")
 		unhealthy_loop:
 			for {
 				// currently in an unhealthy state
-				wgCidr, err = rawclient.Connect(httpClient, serverIp, token, key, ifname, wgCidr)
+				wgCidr, err = client.Connect(httpClient, serverIp, token, key, ifname, wgCidr)
 				if err == nil {
 					log.Println("Reconnected...")
 					break unhealthy_loop
 				}
-				if !rawclient.IsRecoverableError(err) {
+				if !client.IsRecoverableError(err) {
 					return fmt.Errorf("unrecoverable connection error: %w", err)
 				}
 				log.Printf("Failed to reconnect: %v", err)

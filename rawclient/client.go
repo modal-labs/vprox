@@ -1,4 +1,4 @@
-package rawclient
+package client
 
 import (
 	"bytes"

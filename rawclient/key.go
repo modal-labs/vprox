@@ -1,11 +1,11 @@
-// Package rawclient is a variant of the vprox client (lib/client.go) that
+// Package client is a variant of the vprox client (lib/client.go) that
 // does not depend on wgctrl. It is written as free functions parametrized by
 // the data they operate on, and talks to the kernel WireGuard module directly
 // over generic netlink, implementing only the narrow slice of functionality
 // that the vprox client actually uses.
 //
 // Linux-only.
-package rawclient
+package client
 
 import (
 	"crypto/rand"
