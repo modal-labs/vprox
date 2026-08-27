@@ -124,6 +124,13 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Notify the server when we disconnect so it can reclaim resources immediately.
+	defer func() {
+		log.Println("About send /disconnect request to server.")
+		if err := sendDisconnectRequest(httpClient, serverIp, token, key); err != nil {
+			log.Printf("warning: failed to disconnect from server: %v", err)
+		}
+	}()
 	if err = netlink.LinkSetUp(link(ifname)); err != nil {
 		return fmt.Errorf("error setting up vprox interface: %v", err)
 	}
@@ -139,13 +146,6 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("error configuring wireguard interface: %v", err)
 	}
-	// Notify the server when we disconnect so it can reclaim resources immediately.
-	defer func() {
-		log.Println("About send /disconnect request to server.")
-		if err := sendDisconnectRequest(httpClient, serverIp, token, key); err != nil {
-			log.Printf("warning: failed to disconnect from server: %v", err)
-		}
-	}()
 
 	log.Println("Connected...")
 	if !waitForHealthyConnectionRaw(ctx, ifname, wgCidr) {
