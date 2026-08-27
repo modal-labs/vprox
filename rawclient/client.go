@@ -298,14 +298,40 @@ func DeleteInterface(ifname string) {
 	}
 }
 
-// Connect performs one (re)connection attempt: it asks the server for a peer
-// slot, brings the interface up, updates the interface address if the
-// assignment changed, and configures the kernel WireGuard device.
+// ConnectInitial performs the first connection after the interface is
+// created: it asks the server for a peer slot, brings the interface up, adds
+// the assigned address to the interface, and configures the kernel WireGuard
+// device.
 //
-// oldCidr is the CIDR currently assigned to the interface (zero value if
-// none); the returned prefix is the now-current CIDR and must be passed to
-// the next Connect and to CheckConnection.
-func Connect(
+// The returned prefix is the now-current CIDR; pass it to CheckConnection
+// and to Reconnect.
+func ConnectInitial(
+	httpClient *http.Client,
+	serverIp netip.Addr,
+	token string,
+	privateKey Key,
+	ifname string,
+) (netip.Prefix, error) {
+	resp, newCidr, err := negotiate(httpClient, serverIp, token, privateKey, ifname)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+
+	if err := addInterfaceAddr(ifname, newCidr); err != nil {
+		return netip.Prefix{}, err
+	}
+
+	if err := configurePeer(resp, serverIp, privateKey, ifname); err != nil {
+		return newCidr, err
+	}
+	return newCidr, nil
+}
+
+// Reconnect performs a subsequent connection attempt. oldCidr is the CIDR
+// currently assigned to the interface (from ConnectInitial or a previous
+// Reconnect); if the server assigns a different one, the interface address
+// is replaced. The returned prefix is the now-current CIDR.
+func Reconnect(
 	httpClient *http.Client,
 	serverIp netip.Addr,
 	token string,
@@ -313,28 +339,68 @@ func Connect(
 	ifname string,
 	oldCidr netip.Prefix,
 ) (netip.Prefix, error) {
-	resp, err := sendConnectionRequest(httpClient, serverIp, token, privateKey)
+	resp, newCidr, err := negotiate(httpClient, serverIp, token, privateKey, ifname)
 	if err != nil {
 		return oldCidr, err
 	}
 
-	if err := netlink.LinkSetUp(link(ifname)); err != nil {
-		return oldCidr, fmt.Errorf("error setting up vprox interface: %v", err)
-	}
-
-	newCidr, err := netip.ParsePrefix(resp.AssignedAddr)
-	if err != nil {
-		return oldCidr, fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
-	}
 	if newCidr != oldCidr {
-		if err := updateInterfaceAddr(ifname, oldCidr, newCidr); err != nil {
+		oldIpnet := prefixToIPNet(oldCidr)
+		if err := netlink.AddrDel(link(ifname), &netlink.Addr{IPNet: &oldIpnet}); err != nil {
+			log.Printf("warning: failed to remove old address from vprox interface when reconnecting: %v", err)
+		}
+		if err := addInterfaceAddr(ifname, newCidr); err != nil {
 			return oldCidr, err
 		}
 	}
 
+	if err := configurePeer(resp, serverIp, privateKey, ifname); err != nil {
+		return newCidr, err
+	}
+	return newCidr, nil
+}
+
+// negotiate performs the connection steps shared by ConnectInitial and
+// Reconnect: it requests a peer slot from the server, brings the interface
+// up, and parses the assigned CIDR.
+func negotiate(
+	httpClient *http.Client,
+	serverIp netip.Addr,
+	token string,
+	privateKey Key,
+	ifname string,
+) (connectResponse, netip.Prefix, error) {
+	resp, err := sendConnectionRequest(httpClient, serverIp, token, privateKey)
+	if err != nil {
+		return connectResponse{}, netip.Prefix{}, err
+	}
+
+	if err := netlink.LinkSetUp(link(ifname)); err != nil {
+		return connectResponse{}, netip.Prefix{}, fmt.Errorf("error setting up vprox interface: %v", err)
+	}
+
+	newCidr, err := netip.ParsePrefix(resp.AssignedAddr)
+	if err != nil {
+		return connectResponse{}, netip.Prefix{}, fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
+	}
+	return resp, newCidr, nil
+}
+
+// addInterfaceAddr adds cidr as an address of interface ifname.
+func addInterfaceAddr(ifname string, cidr netip.Prefix) error {
+	ipnet := prefixToIPNet(cidr)
+	if err := netlink.AddrAdd(link(ifname), &netlink.Addr{IPNet: &ipnet}); err != nil {
+		return fmt.Errorf("failed to add new address to vprox interface: %v", err)
+	}
+	return nil
+}
+
+// configurePeer configures the kernel WireGuard device from the server's
+// connect response.
+func configurePeer(resp connectResponse, serverIp netip.Addr, privateKey Key, ifname string) error {
 	serverPublicKey, err := ParseKey(resp.ServerPublicKey)
 	if err != nil {
-		return newCidr, fmt.Errorf("failed to parse server public key: %v", err)
+		return fmt.Errorf("failed to parse server public key: %v", err)
 	}
 	err = ConfigureWireguardDevice(
 		ifname,
@@ -345,26 +411,7 @@ func Connect(
 		KeepaliveInterval,
 	)
 	if err != nil {
-		return newCidr, fmt.Errorf("error configuring wireguard interface: %v", err)
-	}
-
-	return newCidr, nil
-}
-
-// updateInterfaceAddr replaces the interface's address: the old address
-// (if any) is removed and the new one added.
-func updateInterfaceAddr(ifname string, oldCidr netip.Prefix, newCidr netip.Prefix) error {
-	l := link(ifname)
-	if oldCidr.IsValid() {
-		oldIpnet := prefixToIPNet(oldCidr)
-		if err := netlink.AddrDel(l, &netlink.Addr{IPNet: &oldIpnet}); err != nil {
-			log.Printf("warning: failed to remove old address from vprox interface when reconnecting: %v", err)
-		}
-	}
-
-	ipnet := prefixToIPNet(newCidr)
-	if err := netlink.AddrAdd(l, &netlink.Addr{IPNet: &ipnet}); err != nil {
-		return fmt.Errorf("failed to add new address to vprox interface: %v", err)
+		return fmt.Errorf("error configuring wireguard interface: %v", err)
 	}
 	return nil
 }

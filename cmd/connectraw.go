@@ -93,8 +93,7 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	}
 	defer client.DeleteInterface(ifname)
 
-	var wgCidr netip.Prefix
-	wgCidr, err = client.Connect(httpClient, serverIp, token, key, ifname, wgCidr)
+	wgCidr, err := client.ConnectInitial(httpClient, serverIp, token, key, ifname)
 	if err != nil {
 		return err
 	}
@@ -127,7 +126,7 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 		unhealthy_loop:
 			for {
 				// currently in an unhealthy state
-				wgCidr, err = client.Connect(httpClient, serverIp, token, key, ifname, wgCidr)
+				wgCidr, err = client.Reconnect(httpClient, serverIp, token, key, ifname, wgCidr)
 				if err == nil {
 					log.Println("Reconnected...")
 					break unhealthy_loop
