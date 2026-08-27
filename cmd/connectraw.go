@@ -461,7 +461,7 @@ func RequestPeerIpFromServer(
 	privateKey Key,
 	ifname string,
 ) (ConnectResponse, netip.Prefix, error) {
-	resp, err := sendConnectionRequest(httpClient, serverIp, token, privateKey)
+	resp, err := sendConnectRequest(httpClient, serverIp, token, privateKey)
 	if err != nil {
 		return ConnectResponse{}, netip.Prefix{}, err
 	}
@@ -516,9 +516,9 @@ func ConfigurePeer(resp ConnectResponse, serverIp netip.Addr, privateKey Key, if
 	return nil
 }
 
-// sendConnectionRequest POSTs /connect to the server, authenticating with
+// sendConnectRequest POSTs /connect to the server, authenticating with
 // token and identifying this peer by the public key of privateKey.
-func sendConnectionRequest(
+func sendConnectRequest(
 	httpClient *http.Client,
 	serverIp netip.Addr,
 	token string,
