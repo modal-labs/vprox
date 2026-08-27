@@ -120,13 +120,9 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	}
 	defer DeleteInterface(ifname)
 
-	resp, err := sendConnectRequest(httpClient, serverIp, token, key)
+	resp, wgCidr, err := RequestPeerIpFromServer(httpClient, serverIp, token, key)
 	if err != nil {
 		return err
-	}
-	wgCidr, err := netip.ParsePrefix(resp.AssignedAddr)
-	if err != nil {
-		return fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
 	}
 	if err = netlink.LinkSetUp(link(ifname)); err != nil {
 		return fmt.Errorf("error setting up vprox interface: %v", err)
@@ -176,16 +172,11 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 					resp    ConnectResponse
 					newCidr netip.Prefix
 				)
-				resp, err = sendConnectRequest(httpClient, serverIp, token, key)
+				resp, newCidr, err = RequestPeerIpFromServer(httpClient, serverIp, token, key)
 				if err != nil {
 					if !IsRecoverableError(err) {
 						return fmt.Errorf("unrecoverable connection error: %w", err)
 					}
-					goto retry
-				}
-				newCidr, err = netip.ParsePrefix(resp.AssignedAddr)
-				if err != nil {
-					err = fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
 					goto retry
 				}
 				if err = netlink.LinkSetUp(link(ifname)); err != nil {
@@ -485,6 +476,27 @@ func DeleteInterface(ifname string) {
 	} else {
 		log.Printf("successfully deleted vprox interface %v", ifname)
 	}
+}
+
+// RequestPeerIpFromServer registers this client as a peer with the server via
+// POST /connect and parses the assigned CIDR from the response. The returned
+// response also carries the server's public key and WireGuard listen port,
+// needed to configure the device via ConfigureWireguardDevice.
+func RequestPeerIpFromServer(
+	httpClient *http.Client,
+	serverIp netip.Addr,
+	token string,
+	privateKey Key,
+) (ConnectResponse, netip.Prefix, error) {
+	resp, err := sendConnectRequest(httpClient, serverIp, token, privateKey)
+	if err != nil {
+		return ConnectResponse{}, netip.Prefix{}, err
+	}
+	cidr, err := netip.ParsePrefix(resp.AssignedAddr)
+	if err != nil {
+		return ConnectResponse{}, netip.Prefix{}, fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
+	}
+	return resp, cidr, nil
 }
 
 // AddAddressToInterface adds cidr as an address of interface ifname.
