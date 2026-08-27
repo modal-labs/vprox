@@ -139,7 +139,7 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	// Notify the server when we disconnect so it can reclaim resources immediately.
 	defer func() {
 		log.Println("About send /disconnect request to server.")
-		if err := Disconnect(httpClient, serverIp, token, key); err != nil {
+		if err := sendDisconnectRequest(httpClient, serverIp, token, key); err != nil {
 			log.Printf("warning: failed to disconnect from server: %v", err)
 		}
 	}()
@@ -578,10 +578,10 @@ func sendConnectRequest(
 	return respJson, nil
 }
 
-// Disconnect notifies the server that this client is disconnecting, allowing
+// sendDisconnectRequest notifies the server that this client is disconnecting, allowing
 // the server to immediately reclaim resources (wireguard peer and subnet IP)
 // instead of waiting for the idle timeout.
-func Disconnect(httpClient *http.Client, serverIp netip.Addr, token string, privateKey Key) error {
+func sendDisconnectRequest(httpClient *http.Client, serverIp netip.Addr, token string, privateKey Key) error {
 	disconnectUrl, err := url.Parse(fmt.Sprintf("https://%s/disconnect", serverIp))
 	if err != nil {
 		return fmt.Errorf("failed to parse disconnect URL: %v", err)
