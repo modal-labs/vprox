@@ -101,6 +101,10 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if err = CheckWireguardSupported(); err != nil {
+		return err
+	}
+
 	httpClient := &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
@@ -428,6 +432,21 @@ func IsRecoverableError(err error) bool {
 		return connErr.Recoverable
 	}
 	return true
+}
+
+// CheckWireguardSupported reports whether the kernel WireGuard module is
+// available, by resolving the "wireguard" generic netlink family.
+func CheckWireguardSupported() error {
+	conn, err := genetlink.Dial(nil)
+	if err != nil {
+		return fmt.Errorf("failed to dial generic netlink: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.GetFamily(unix.WG_GENL_NAME); err != nil {
+		return fmt.Errorf("wireguard generic netlink family unavailable (is the wireguard module loaded?): %v", err)
+	}
+	return nil
 }
 
 type connectRequest struct {
