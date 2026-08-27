@@ -124,12 +124,12 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err = netlink.LinkSetUp(link(ifname)); err != nil {
-		return fmt.Errorf("error setting up vprox interface: %v", err)
-	}
 	wgCidr, err := netip.ParsePrefix(resp.AssignedAddr)
 	if err != nil {
 		return fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
+	}
+	if err = netlink.LinkSetUp(link(ifname)); err != nil {
+		return fmt.Errorf("error setting up vprox interface: %v", err)
 	}
 	if err = AddAddressToInterface(ifname, wgCidr); err != nil {
 		return err
@@ -183,13 +183,13 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 					}
 					goto retry
 				}
-				if err = netlink.LinkSetUp(link(ifname)); err != nil {
-					err = fmt.Errorf("error setting up vprox interface: %v", err)
-					goto retry
-				}
 				newCidr, err = netip.ParsePrefix(resp.AssignedAddr)
 				if err != nil {
 					err = fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
+					goto retry
+				}
+				if err = netlink.LinkSetUp(link(ifname)); err != nil {
+					err = fmt.Errorf("error setting up vprox interface: %v", err)
 					goto retry
 				}
 				if newCidr != wgCidr {
