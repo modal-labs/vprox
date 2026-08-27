@@ -322,9 +322,14 @@ func Connect(
 		return oldCidr, fmt.Errorf("error setting up vprox interface: %v", err)
 	}
 
-	newCidr, err := updateInterfaceAddr(ifname, oldCidr, resp.AssignedAddr)
+	newCidr, err := netip.ParsePrefix(resp.AssignedAddr)
 	if err != nil {
-		return oldCidr, err
+		return oldCidr, fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
+	}
+	if newCidr != oldCidr {
+		if err := updateInterfaceAddr(ifname, oldCidr, newCidr); err != nil {
+			return oldCidr, err
+		}
 	}
 
 	serverPublicKey, err := ParseKey(resp.ServerPublicKey)
@@ -346,19 +351,9 @@ func Connect(
 	return newCidr, nil
 }
 
-// updateInterfaceAddr ensures the interface carries the newly assigned
-// address. If the assignment differs from oldCidr, the old address (if any)
-// is removed and the new one added. Returns the now-current CIDR.
-func updateInterfaceAddr(ifname string, oldCidr netip.Prefix, assignedAddr string) (netip.Prefix, error) {
-	cidr, err := netip.ParsePrefix(assignedAddr)
-	if err != nil {
-		return oldCidr, fmt.Errorf("failed to parse assigned address %v: %v", assignedAddr, err)
-	}
-
-	if cidr == oldCidr {
-		return oldCidr, nil
-	}
-
+// updateInterfaceAddr replaces the interface's address: the old address
+// (if any) is removed and the new one added.
+func updateInterfaceAddr(ifname string, oldCidr netip.Prefix, newCidr netip.Prefix) error {
 	l := link(ifname)
 	if oldCidr.IsValid() {
 		oldIpnet := prefixToIPNet(oldCidr)
@@ -367,11 +362,11 @@ func updateInterfaceAddr(ifname string, oldCidr netip.Prefix, assignedAddr strin
 		}
 	}
 
-	ipnet := prefixToIPNet(cidr)
+	ipnet := prefixToIPNet(newCidr)
 	if err := netlink.AddrAdd(l, &netlink.Addr{IPNet: &ipnet}); err != nil {
-		return oldCidr, fmt.Errorf("failed to add new address to vprox interface: %v", err)
+		return fmt.Errorf("failed to add new address to vprox interface: %v", err)
 	}
-	return cidr, nil
+	return nil
 }
 
 // sendConnectionRequest POSTs /connect to the server, authenticating with
