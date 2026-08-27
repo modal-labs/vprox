@@ -1,8 +1,18 @@
+// Package client is a variant of the vprox client (lib/client.go) that
+// does not depend on wgctrl. It is written as free functions parametrized by
+// the data they operate on, and talks to the kernel WireGuard module directly
+// over generic netlink, implementing only the narrow slice of functionality
+// that the vprox client actually uses.
+//
+// Linux-only.
 package client
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,11 +22,206 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"path"
+	"strings"
 	"time"
+	"unsafe"
 
+	"github.com/mdlayher/genetlink"
+	mnetlink "github.com/mdlayher/netlink"
+	"github.com/mdlayher/netlink/nlenc"
 	probing "github.com/prometheus-community/pro-bing"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/sys/unix"
 )
+
+// KeyLen is the length in bytes of a WireGuard Curve25519 key.
+const KeyLen = 32
+
+// Key is a WireGuard private or public key (raw Curve25519 bytes).
+type Key [KeyLen]byte
+
+// GeneratePrivateKey returns a new clamped Curve25519 private key.
+func GeneratePrivateKey() (Key, error) {
+	var key Key
+	if _, err := rand.Read(key[:]); err != nil {
+		return Key{}, fmt.Errorf("failed to read random bytes: %v", err)
+	}
+	// Standard Curve25519 clamping, as done by wireguard-tools.
+	key[0] &= 248
+	key[31] &= 127
+	key[31] |= 64
+	return key, nil
+}
+
+// PublicKey computes the public key corresponding to private key priv.
+func PublicKey(priv Key) Key {
+	var pub Key
+	p, _ := curve25519.X25519(priv[:], curve25519.Basepoint)
+	copy(pub[:], p)
+	return pub
+}
+
+// KeyString returns the base64 encoding of key, as used on the wire and in
+// key files.
+func KeyString(key Key) string {
+	return base64.StdEncoding.EncodeToString(key[:])
+}
+
+// ParseKey parses a base64-encoded key.
+func ParseKey(s string) (Key, error) {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return Key{}, fmt.Errorf("failed to parse key: %v", err)
+	}
+	if len(b) != KeyLen {
+		return Key{}, fmt.Errorf("incorrect key size: %d", len(b))
+	}
+	var key Key
+	copy(key[:], b)
+	return key, nil
+}
+
+// runDir is the path for runtime data that should be kept across restarts.
+const runDir = "/run/vprox"
+
+// LoadOrGenerateClientKey returns the persisted client private key for the
+// given interface, generating and persisting a new one on first use.
+// The key lives at /run/vprox/client-key-<ifname>.
+func LoadOrGenerateClientKey(ifname string) (Key, error) {
+	if err := os.MkdirAll(runDir, 0700); err != nil {
+		return Key{}, err
+	}
+	keyFile := path.Join(runDir, "client-key-"+ifname)
+	contents, err := os.ReadFile(keyFile)
+	if os.IsNotExist(err) {
+		key, err := GeneratePrivateKey()
+		if err != nil {
+			return Key{}, err
+		}
+		if err = os.WriteFile(keyFile, []byte(KeyString(key)), 0600); err != nil {
+			return Key{}, err
+		}
+		return key, nil
+	} else if err != nil {
+		return Key{}, err
+	}
+	return ParseKey(strings.TrimSpace(string(contents)))
+}
+
+// ConfigureWireguardDevice configures the WireGuard device named ifname the
+// specific way the vprox client uses it, via a single WG_CMD_SET_DEVICE
+// generic netlink request:
+//
+//   - set the device private key
+//   - replace all peers with a single server peer, identified by
+//     serverPublicKey, reachable at endpoint (IPv4 UDP), with a persistent
+//     keepalive and allowed IPs replaced by 0.0.0.0/0 (route everything).
+//
+// This is the wgctrl-free equivalent of
+// wgctrl.Client.ConfigureDevice(ifname, wgtypes.Config{...}) as called from
+// lib/client.go configureWireguard.
+func ConfigureWireguardDevice(
+	ifname string,
+	privateKey Key,
+	serverPublicKey Key,
+	endpointIp net.IP,
+	endpointPort int,
+	keepalive time.Duration,
+) error {
+	attrs, err := encodeSetDeviceRequest(ifname, privateKey, serverPublicKey, endpointIp, endpointPort, keepalive)
+	if err != nil {
+		return err
+	}
+
+	// Dial a generic netlink socket and resolve the "wireguard" family, whose
+	// numeric ID addresses the kernel WireGuard module.
+	conn, err := genetlink.Dial(nil)
+	if err != nil {
+		return fmt.Errorf("failed to dial generic netlink: %v", err)
+	}
+	defer conn.Close()
+
+	family, err := conn.GetFamily(unix.WG_GENL_NAME)
+	if err != nil {
+		return fmt.Errorf("wireguard generic netlink family unavailable (is the wireguard module loaded?): %v", err)
+	}
+
+	msg := genetlink.Message{
+		Header: genetlink.Header{
+			Command: unix.WG_CMD_SET_DEVICE,
+			Version: unix.WG_GENL_VERSION,
+		},
+		Data: attrs,
+	}
+	if _, err := conn.Execute(msg, family.ID, mnetlink.Request|mnetlink.Acknowledge); err != nil {
+		return fmt.Errorf("WG_CMD_SET_DEVICE failed: %w", err)
+	}
+	return nil
+}
+
+// encodeSetDeviceRequest encodes the netlink attribute payload for the
+// WG_CMD_SET_DEVICE request described in ConfigureWireguardDevice.
+func encodeSetDeviceRequest(
+	ifname string,
+	privateKey Key,
+	serverPublicKey Key,
+	endpointIp net.IP,
+	endpointPort int,
+	keepalive time.Duration,
+) ([]byte, error) {
+	ip4 := endpointIp.To4()
+	if ip4 == nil {
+		return nil, fmt.Errorf("endpoint IP %v is not IPv4", endpointIp)
+	}
+
+	ae := mnetlink.NewAttributeEncoder()
+	ae.String(unix.WGDEVICE_A_IFNAME, ifname)
+	ae.Bytes(unix.WGDEVICE_A_PRIVATE_KEY, privateKey[:])
+	// Wipe any existing peers; the client only ever has the one server peer.
+	ae.Uint32(unix.WGDEVICE_A_FLAGS, unix.WGDEVICE_F_REPLACE_PEERS)
+
+	ae.Nested(unix.WGDEVICE_A_PEERS, func(nae *mnetlink.AttributeEncoder) error {
+		// Netlink arrays use the attribute type as an array index.
+		nae.Nested(0, func(pae *mnetlink.AttributeEncoder) error {
+			pae.Bytes(unix.WGPEER_A_PUBLIC_KEY, serverPublicKey[:])
+			pae.Uint32(unix.WGPEER_A_FLAGS, unix.WGPEER_F_REPLACE_ALLOWEDIPS)
+			pae.Do(unix.WGPEER_A_ENDPOINT, func() ([]byte, error) {
+				var addr [4]byte
+				copy(addr[:], ip4)
+				sa := unix.RawSockaddrInet4{
+					Family: unix.AF_INET,
+					Port:   sockaddrPort(endpointPort),
+					Addr:   addr,
+				}
+				return (*(*[unix.SizeofSockaddrInet4]byte)(unsafe.Pointer(&sa)))[:], nil
+			})
+			pae.Uint16(unix.WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL, uint16(keepalive.Seconds()))
+			pae.Nested(unix.WGPEER_A_ALLOWEDIPS, func(aae *mnetlink.AttributeEncoder) error {
+				// Single allowed IP: 0.0.0.0/0 (all IPv4 traffic).
+				aae.Nested(0, func(ipae *mnetlink.AttributeEncoder) error {
+					ipae.Uint16(unix.WGALLOWEDIP_A_FAMILY, unix.AF_INET)
+					ipae.Bytes(unix.WGALLOWEDIP_A_IPADDR, net.IPv4zero.To4())
+					ipae.Uint8(unix.WGALLOWEDIP_A_CIDR_MASK, 0)
+					return nil
+				})
+				return nil
+			})
+			return nil
+		})
+		return nil
+	})
+
+	return ae.Encode()
+}
+
+// sockaddrPort interprets port as a big endian uint16 for use in sockaddr
+// structures passed to the kernel.
+func sockaddrPort(port int) uint16 {
+	return binary.BigEndian.Uint16(nlenc.Uint16Bytes(uint16(port)))
+}
 
 // This file is the wgctrl-free counterpart of lib/client.go, written as free
 // functions parametrized by the data they act on instead of methods on a
