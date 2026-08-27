@@ -165,9 +165,9 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 		case <-time.After(healthCheckInterval):
 		}
 
-		currentStatus := SendPingsThroughTunnel(ifname, wgCidr, healthCheckTimeout, ctx)
+		atLeastOnePingSucceeded := SendPingsThroughTunnel(ifname, wgCidr, healthCheckTimeout, ctx)
 
-		if !currentStatus {
+		if !atLeastOnePingSucceeded {
 			log.Println("No longer connected. Attempting to reconnect...")
 		unhealthy_loop:
 			for {
