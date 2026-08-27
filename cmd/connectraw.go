@@ -71,7 +71,7 @@ func waitForHealthyConnectionRaw(ctx context.Context, ifname string, wgCidr neti
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	for {
-		if CheckConnection(ifname, wgCidr, healthCheckTimeout, ctx) {
+		if SendPingsThroughTunnel(ifname, wgCidr, healthCheckTimeout, ctx) {
 			return true
 		}
 		log.Printf("health check failed, retrying...")
@@ -158,7 +158,7 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 		case <-time.After(healthCheckInterval):
 		}
 
-		currentStatus := CheckConnection(ifname, wgCidr, healthCheckTimeout, ctx)
+		currentStatus := SendPingsThroughTunnel(ifname, wgCidr, healthCheckTimeout, ctx)
 
 		if !currentStatus {
 			log.Println("No longer connected. Attempting to reconnect...")
@@ -617,12 +617,12 @@ func sendDisconnectRequest(httpClient *http.Client, serverIp netip.Addr, token s
 	return nil
 }
 
-// CheckConnection checks the health of the tunnel by pinging the server's
+// SendPingsThroughTunnel checks the health of the tunnel by pinging the server's
 // tunnel-internal address (the first host of the assigned subnet wgCidr)
 // through interface ifname. It sends 3 pings in quick succession and blocks
 // until they receive a response or the timeout passes; healthy means at
 // least one response arrived.
-func CheckConnection(ifname string, wgCidr netip.Prefix, timeout time.Duration, cancelCtx context.Context) bool {
+func SendPingsThroughTunnel(ifname string, wgCidr netip.Prefix, timeout time.Duration, cancelCtx context.Context) bool {
 	pinger, err := probing.NewPinger(wgCidr.Masked().Addr().Next().String())
 	if err != nil {
 		log.Printf("error creating pinger: %v", err)
