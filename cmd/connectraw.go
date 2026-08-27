@@ -124,10 +124,6 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	wgCidr, err := netip.ParsePrefix(resp.AssignedAddr)
-	if err != nil {
-		return fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
-	}
 	// Notify the server when we disconnect so it can reclaim resources immediately.
 	defer func() {
 		log.Println("About send /disconnect request to server.")
@@ -135,6 +131,10 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 			log.Printf("warning: failed to disconnect from server: %v", err)
 		}
 	}()
+	wgCidr, err := netip.ParsePrefix(resp.AssignedAddr)
+	if err != nil {
+		return fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
+	}
 	if err = netlink.LinkSetUp(link(ifname)); err != nil {
 		return fmt.Errorf("error setting up vprox interface: %v", err)
 	}
