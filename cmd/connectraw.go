@@ -131,9 +131,9 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 			log.Printf("warning: failed to disconnect from server: %v", err)
 		}
 	}()
-	wgCidr, err := netip.ParsePrefix(resp.AssignedAddr)
+	wgCidr, serverPublicKey, serverListenPort, err := parseConnectResponse(resp)
 	if err != nil {
-		return fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
+		return err
 	}
 	if err = netlink.LinkSetUp(link(ifname)); err != nil {
 		return fmt.Errorf("error setting up vprox interface: %v", err)
@@ -141,12 +141,8 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	if err = AddAddressToInterface(ifname, wgCidr); err != nil {
 		return err
 	}
-	serverPublicKey, err := ParseKey(resp.ServerPublicKey)
-	if err != nil {
-		return fmt.Errorf("failed to parse server public key: %v", err)
-	}
 	err = ConfigureWireguardDevice(ifname, key, serverPublicKey,
-		serverIp.AsSlice(), resp.ServerListenPort, KeepaliveInterval)
+		serverIp.AsSlice(), serverListenPort, KeepaliveInterval)
 	if err != nil {
 		return fmt.Errorf("error configuring wireguard interface: %v", err)
 	}
@@ -183,9 +179,8 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 					}
 					goto retry
 				}
-				newCidr, err = netip.ParsePrefix(resp.AssignedAddr)
+				newCidr, serverPublicKey, serverListenPort, err = parseConnectResponse(resp)
 				if err != nil {
-					err = fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
 					goto retry
 				}
 				if err = netlink.LinkSetUp(link(ifname)); err != nil {
@@ -199,13 +194,8 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 					}
 					wgCidr = newCidr
 				}
-				serverPublicKey, err = ParseKey(resp.ServerPublicKey)
-				if err != nil {
-					err = fmt.Errorf("failed to parse server public key: %v", err)
-					goto retry
-				}
 				err = ConfigureWireguardDevice(ifname, key, serverPublicKey,
-					serverIp.AsSlice(), resp.ServerListenPort, KeepaliveInterval)
+					serverIp.AsSlice(), serverListenPort, KeepaliveInterval)
 				if err != nil {
 					err = fmt.Errorf("error configuring wireguard interface: %v", err)
 					goto retry
@@ -485,6 +475,21 @@ func DeleteInterface(ifname string) {
 	} else {
 		log.Printf("successfully deleted vprox interface %v", ifname)
 	}
+}
+
+// parseConnectResponse parses the assigned CIDR and server public key out of
+// a connect response, returning them along with the server's WireGuard
+// listen port.
+func parseConnectResponse(resp ConnectResponse) (netip.Prefix, Key, int, error) {
+	cidr, err := netip.ParsePrefix(resp.AssignedAddr)
+	if err != nil {
+		return netip.Prefix{}, Key{}, 0, fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
+	}
+	serverPublicKey, err := ParseKey(resp.ServerPublicKey)
+	if err != nil {
+		return netip.Prefix{}, Key{}, 0, fmt.Errorf("failed to parse server public key: %v", err)
+	}
+	return cidr, serverPublicKey, resp.ServerListenPort, nil
 }
 
 // AddAddressToInterface adds cidr as an address of interface ifname.
