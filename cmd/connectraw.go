@@ -93,8 +93,14 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	}
 	defer client.DeleteInterface(ifname)
 
-	wgCidr, err := client.ConnectInitial(httpClient, serverIp, token, key, ifname)
+	resp, wgCidr, err := client.RequestPeerIP(httpClient, serverIp, token, key, ifname)
 	if err != nil {
+		return err
+	}
+	if err = client.AddInterfaceAddr(ifname, wgCidr); err != nil {
+		return err
+	}
+	if err = client.ConfigurePeer(resp, serverIp, key, ifname); err != nil {
 		return err
 	}
 	// Notify the server when we disconnect so it can reclaim resources immediately.
@@ -126,8 +132,18 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 		unhealthy_loop:
 			for {
 				// currently in an unhealthy state
-				wgCidr, err = client.Reconnect(httpClient, serverIp, token, key, ifname, wgCidr)
+				var resp client.ConnectResponse
+				var newCidr netip.Prefix
+				resp, newCidr, err = client.RequestPeerIP(httpClient, serverIp, token, key, ifname)
+				if err == nil && newCidr != wgCidr {
+					client.RemoveInterfaceAddr(ifname, wgCidr)
+					err = client.AddInterfaceAddr(ifname, newCidr)
+				}
 				if err == nil {
+					err = client.ConfigurePeer(resp, serverIp, key, ifname)
+				}
+				if err == nil {
+					wgCidr = newCidr
 					log.Println("Reconnected...")
 					break unhealthy_loop
 				}

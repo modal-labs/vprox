@@ -255,7 +255,7 @@ type connectRequest struct {
 	PeerPublicKey string
 }
 
-type connectResponse struct {
+type ConnectResponse struct {
 	AssignedAddr     string
 	ServerPublicKey  string
 	ServerListenPort int
@@ -298,96 +298,35 @@ func DeleteInterface(ifname string) {
 	}
 }
 
-// ConnectInitial performs the first connection after the interface is
-// created: it asks the server for a peer slot, brings the interface up, adds
-// the assigned address to the interface, and configures the kernel WireGuard
-// device.
-//
-// The returned prefix is the now-current CIDR; pass it to CheckConnection
-// and to Reconnect.
-func ConnectInitial(
+// RequestPeerIP registers this client as a peer with the server via
+// POST /connect, brings the interface up, and parses the assigned CIDR.
+// The returned response also carries the server's public key and WireGuard
+// listen port, needed to configure the device via ConfigurePeer.
+func RequestPeerIP(
 	httpClient *http.Client,
 	serverIp netip.Addr,
 	token string,
 	privateKey Key,
 	ifname string,
-) (netip.Prefix, error) {
-	resp, newCidr, err := negotiate(httpClient, serverIp, token, privateKey, ifname)
-	if err != nil {
-		return netip.Prefix{}, err
-	}
-
-	if err := addInterfaceAddr(ifname, newCidr); err != nil {
-		return netip.Prefix{}, err
-	}
-
-	if err := configurePeer(resp, serverIp, privateKey, ifname); err != nil {
-		return newCidr, err
-	}
-	return newCidr, nil
-}
-
-// Reconnect performs a subsequent connection attempt. oldCidr is the CIDR
-// currently assigned to the interface (from ConnectInitial or a previous
-// Reconnect); if the server assigns a different one, the interface address
-// is replaced. The returned prefix is the now-current CIDR.
-func Reconnect(
-	httpClient *http.Client,
-	serverIp netip.Addr,
-	token string,
-	privateKey Key,
-	ifname string,
-	oldCidr netip.Prefix,
-) (netip.Prefix, error) {
-	resp, newCidr, err := negotiate(httpClient, serverIp, token, privateKey, ifname)
-	if err != nil {
-		return oldCidr, err
-	}
-
-	if newCidr != oldCidr {
-		oldIpnet := prefixToIPNet(oldCidr)
-		if err := netlink.AddrDel(link(ifname), &netlink.Addr{IPNet: &oldIpnet}); err != nil {
-			log.Printf("warning: failed to remove old address from vprox interface when reconnecting: %v", err)
-		}
-		if err := addInterfaceAddr(ifname, newCidr); err != nil {
-			return oldCidr, err
-		}
-	}
-
-	if err := configurePeer(resp, serverIp, privateKey, ifname); err != nil {
-		return newCidr, err
-	}
-	return newCidr, nil
-}
-
-// negotiate performs the connection steps shared by ConnectInitial and
-// Reconnect: it requests a peer slot from the server, brings the interface
-// up, and parses the assigned CIDR.
-func negotiate(
-	httpClient *http.Client,
-	serverIp netip.Addr,
-	token string,
-	privateKey Key,
-	ifname string,
-) (connectResponse, netip.Prefix, error) {
+) (ConnectResponse, netip.Prefix, error) {
 	resp, err := sendConnectionRequest(httpClient, serverIp, token, privateKey)
 	if err != nil {
-		return connectResponse{}, netip.Prefix{}, err
+		return ConnectResponse{}, netip.Prefix{}, err
 	}
 
 	if err := netlink.LinkSetUp(link(ifname)); err != nil {
-		return connectResponse{}, netip.Prefix{}, fmt.Errorf("error setting up vprox interface: %v", err)
+		return ConnectResponse{}, netip.Prefix{}, fmt.Errorf("error setting up vprox interface: %v", err)
 	}
 
 	newCidr, err := netip.ParsePrefix(resp.AssignedAddr)
 	if err != nil {
-		return connectResponse{}, netip.Prefix{}, fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
+		return ConnectResponse{}, netip.Prefix{}, fmt.Errorf("failed to parse assigned address %v: %v", resp.AssignedAddr, err)
 	}
 	return resp, newCidr, nil
 }
 
-// addInterfaceAddr adds cidr as an address of interface ifname.
-func addInterfaceAddr(ifname string, cidr netip.Prefix) error {
+// AddInterfaceAddr adds cidr as an address of interface ifname.
+func AddInterfaceAddr(ifname string, cidr netip.Prefix) error {
 	ipnet := prefixToIPNet(cidr)
 	if err := netlink.AddrAdd(link(ifname), &netlink.Addr{IPNet: &ipnet}); err != nil {
 		return fmt.Errorf("failed to add new address to vprox interface: %v", err)
@@ -395,9 +334,18 @@ func addInterfaceAddr(ifname string, cidr netip.Prefix) error {
 	return nil
 }
 
-// configurePeer configures the kernel WireGuard device from the server's
+// RemoveInterfaceAddr removes cidr as an address of interface ifname,
+// logging a warning on failure.
+func RemoveInterfaceAddr(ifname string, cidr netip.Prefix) {
+	ipnet := prefixToIPNet(cidr)
+	if err := netlink.AddrDel(link(ifname), &netlink.Addr{IPNet: &ipnet}); err != nil {
+		log.Printf("warning: failed to remove old address from vprox interface when reconnecting: %v", err)
+	}
+}
+
+// ConfigurePeer configures the kernel WireGuard device from the server's
 // connect response.
-func configurePeer(resp connectResponse, serverIp netip.Addr, privateKey Key, ifname string) error {
+func ConfigurePeer(resp ConnectResponse, serverIp netip.Addr, privateKey Key, ifname string) error {
 	serverPublicKey, err := ParseKey(resp.ServerPublicKey)
 	if err != nil {
 		return fmt.Errorf("failed to parse server public key: %v", err)
@@ -423,17 +371,17 @@ func sendConnectionRequest(
 	serverIp netip.Addr,
 	token string,
 	privateKey Key,
-) (connectResponse, error) {
+) (ConnectResponse, error) {
 	connectUrl, err := url.Parse(fmt.Sprintf("https://%s/connect", serverIp))
 	if err != nil {
-		return connectResponse{}, fmt.Errorf("failed to parse connect URL: %v", err)
+		return ConnectResponse{}, fmt.Errorf("failed to parse connect URL: %v", err)
 	}
 
 	buf, err := json.Marshal(&connectRequest{
 		PeerPublicKey: KeyString(PublicKey(privateKey)),
 	})
 	if err != nil {
-		return connectResponse{}, fmt.Errorf("failed to marshal connect request: %v", err)
+		return ConnectResponse{}, fmt.Errorf("failed to marshal connect request: %v", err)
 	}
 
 	req := &http.Request{
@@ -447,13 +395,13 @@ func sendConnectionRequest(
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return connectResponse{}, fmt.Errorf("failed to connect to server: %v", err)
+		return ConnectResponse{}, fmt.Errorf("failed to connect to server: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		recoverable := resp.StatusCode != http.StatusUnauthorized
-		return connectResponse{}, &ConnectionError{
+		return ConnectResponse{}, &ConnectionError{
 			Message:     fmt.Sprintf("server returned status %v", resp.Status),
 			Recoverable: recoverable,
 		}
@@ -461,10 +409,10 @@ func sendConnectionRequest(
 
 	buf, err = io.ReadAll(resp.Body)
 	if err != nil {
-		return connectResponse{}, fmt.Errorf("failed to read response body: %v", err)
+		return ConnectResponse{}, fmt.Errorf("failed to read response body: %v", err)
 	}
 
-	var respJson connectResponse
+	var respJson ConnectResponse
 	json.Unmarshal(buf, &respJson)
 	return respJson, nil
 }
