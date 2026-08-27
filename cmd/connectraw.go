@@ -383,20 +383,20 @@ func sockaddrPort(port int) uint16 {
 // KeepaliveInterval is the WireGuard persistent keepalive used for the server peer.
 const KeepaliveInterval = 25 * time.Second
 
-// ConnectionError reports whether a connection failure is recoverable.
-type ConnectionError struct {
+// ConnectError reports whether a connection failure is recoverable.
+type ConnectError struct {
 	Message     string
 	Recoverable bool
 }
 
-func (e *ConnectionError) Error() string {
+func (e *ConnectError) Error() string {
 	return e.Message
 }
 
-// IsRecoverableError returns false if the error is a ConnectionError that is
+// IsRecoverableError returns false if the error is a ConnectError that is
 // not recoverable.
 func IsRecoverableError(err error) bool {
-	var connErr *ConnectionError
+	var connErr *ConnectError
 	if errors.As(err, &connErr) {
 		return connErr.Recoverable
 	}
@@ -553,7 +553,7 @@ func sendConnectRequest(
 
 	if resp.StatusCode != http.StatusOK {
 		recoverable := resp.StatusCode != http.StatusUnauthorized
-		return ConnectResponse{}, &ConnectionError{
+		return ConnectResponse{}, &ConnectError{
 			Message:     fmt.Sprintf("server returned status %v", resp.Status),
 			Recoverable: recoverable,
 		}
