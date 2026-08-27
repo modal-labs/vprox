@@ -124,7 +124,7 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err = AddInterfaceAddr(ifname, wgCidr); err != nil {
+	if err = AddAddressToInterface(ifname, wgCidr); err != nil {
 		return err
 	}
 	if err = ConfigurePeer(resp, serverIp, key, ifname); err != nil {
@@ -163,8 +163,8 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 				var newCidr netip.Prefix
 				resp, newCidr, err = RequestPeerIpFromServer(httpClient, serverIp, token, key, ifname)
 				if err == nil && newCidr != wgCidr {
-					RemoveInterfaceAddr(ifname, wgCidr)
-					err = AddInterfaceAddr(ifname, newCidr)
+					RemoveAddressFromInterface(ifname, wgCidr)
+					err = AddAddressToInterface(ifname, newCidr)
 				}
 				if err == nil {
 					err = ConfigurePeer(resp, serverIp, key, ifname)
@@ -477,8 +477,8 @@ func RequestPeerIpFromServer(
 	return resp, newCidr, nil
 }
 
-// AddInterfaceAddr adds cidr as an address of interface ifname.
-func AddInterfaceAddr(ifname string, cidr netip.Prefix) error {
+// AddAddressToInterface adds cidr as an address of interface ifname.
+func AddAddressToInterface(ifname string, cidr netip.Prefix) error {
 	ipnet := prefixToIPNet(cidr)
 	if err := netlink.AddrAdd(link(ifname), &netlink.Addr{IPNet: &ipnet}); err != nil {
 		return fmt.Errorf("failed to add new address to vprox interface: %v", err)
@@ -486,9 +486,9 @@ func AddInterfaceAddr(ifname string, cidr netip.Prefix) error {
 	return nil
 }
 
-// RemoveInterfaceAddr removes cidr as an address of interface ifname,
+// RemoveAddressFromInterface removes cidr as an address of interface ifname,
 // logging a warning on failure.
-func RemoveInterfaceAddr(ifname string, cidr netip.Prefix) {
+func RemoveAddressFromInterface(ifname string, cidr netip.Prefix) {
 	ipnet := prefixToIPNet(cidr)
 	if err := netlink.AddrDel(link(ifname), &netlink.Addr{IPNet: &ipnet}); err != nil {
 		log.Printf("warning: failed to remove old address from vprox interface when reconnecting: %v", err)
