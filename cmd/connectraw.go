@@ -165,14 +165,39 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 		unhealthy_loop:
 			for {
 				// currently in an unhealthy state
-				wgCidr, err = attemptToReconnect(httpClient, serverIp, token, key, ifname, wgCidr)
-				if err == nil {
-					log.Println("Reconnected...")
-					break unhealthy_loop
+				var (
+					resp    ConnectResponse
+					newCidr netip.Prefix
+				)
+				resp, newCidr, err = RequestPeerIpFromServer(httpClient, serverIp, token, key, ifname)
+				if err != nil {
+					if !IsRecoverableError(err) {
+						return fmt.Errorf("unrecoverable connection error: %w", err)
+					}
+					goto retry
 				}
-				if !IsRecoverableError(err) {
-					return fmt.Errorf("unrecoverable connection error: %w", err)
+				if newCidr != wgCidr {
+					RemoveAddressFromInterface(ifname, wgCidr)
+					if err = AddAddressToInterface(ifname, newCidr); err != nil {
+						goto retry
+					}
+					wgCidr = newCidr
 				}
+				serverPublicKey, err = ParseKey(resp.ServerPublicKey)
+				if err != nil {
+					err = fmt.Errorf("failed to parse server public key: %v", err)
+					goto retry
+				}
+				err = ConfigureWireguardDevice(ifname, key, serverPublicKey,
+					serverIp.AsSlice(), resp.ServerListenPort, KeepaliveInterval)
+				if err != nil {
+					err = fmt.Errorf("error configuring wireguard interface: %v", err)
+					goto retry
+				}
+				log.Println("Reconnected...")
+				break unhealthy_loop
+
+			retry:
 				log.Printf("Failed to reconnect: %v", err)
 				select {
 				case <-ctx.Done():
@@ -183,40 +208,6 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
-}
-
-// attemptToReconnect makes one reconnection attempt: it re-requests a peer IP
-// from the server, swaps the interface address if the assignment changed, and
-// reconfigures the kernel WireGuard device. It returns the now-current CIDR,
-// or oldCidr along with the error on failure.
-func attemptToReconnect(
-	httpClient *http.Client,
-	serverIp netip.Addr,
-	token string,
-	key Key,
-	ifname string,
-	oldCidr netip.Prefix,
-) (netip.Prefix, error) {
-	resp, newCidr, err := RequestPeerIpFromServer(httpClient, serverIp, token, key, ifname)
-	if err != nil {
-		return oldCidr, err
-	}
-	if newCidr != oldCidr {
-		RemoveAddressFromInterface(ifname, oldCidr)
-		if err := AddAddressToInterface(ifname, newCidr); err != nil {
-			return oldCidr, err
-		}
-	}
-	serverPublicKey, err := ParseKey(resp.ServerPublicKey)
-	if err != nil {
-		return newCidr, fmt.Errorf("failed to parse server public key: %v", err)
-	}
-	err = ConfigureWireguardDevice(ifname, key, serverPublicKey,
-		serverIp.AsSlice(), resp.ServerListenPort, KeepaliveInterval)
-	if err != nil {
-		return newCidr, fmt.Errorf("error configuring wireguard interface: %v", err)
-	}
-	return newCidr, nil
 }
 
 // KeyLen is the length in bytes of a WireGuard Curve25519 key.
