@@ -127,8 +127,14 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 	if err = AddAddressToInterface(ifname, wgCidr); err != nil {
 		return err
 	}
-	if err = ConfigurePeer(resp, serverIp, key, ifname); err != nil {
-		return err
+	serverPublicKey, err := ParseKey(resp.ServerPublicKey)
+	if err != nil {
+		return fmt.Errorf("failed to parse server public key: %v", err)
+	}
+	err = ConfigureWireguardDevice(ifname, key, serverPublicKey,
+		serverIp.AsSlice(), resp.ServerListenPort, KeepaliveInterval)
+	if err != nil {
+		return fmt.Errorf("error configuring wireguard interface: %v", err)
 	}
 	// Notify the server when we disconnect so it can reclaim resources immediately.
 	defer func() {
@@ -167,7 +173,17 @@ func runConnectRaw(cmd *cobra.Command, args []string) error {
 					err = AddAddressToInterface(ifname, newCidr)
 				}
 				if err == nil {
-					err = ConfigurePeer(resp, serverIp, key, ifname)
+					serverPublicKey, err = ParseKey(resp.ServerPublicKey)
+					if err != nil {
+						err = fmt.Errorf("failed to parse server public key: %v", err)
+					}
+				}
+				if err == nil {
+					err = ConfigureWireguardDevice(ifname, key, serverPublicKey,
+						serverIp.AsSlice(), resp.ServerListenPort, KeepaliveInterval)
+					if err != nil {
+						err = fmt.Errorf("error configuring wireguard interface: %v", err)
+					}
 				}
 				if err == nil {
 					wgCidr = newCidr
@@ -453,7 +469,7 @@ func DeleteInterface(ifname string) {
 // RequestPeerIpFromServer registers this client as a peer with the server via
 // POST /connect, brings the interface up, and parses the assigned CIDR.
 // The returned response also carries the server's public key and WireGuard
-// listen port, needed to configure the device via ConfigurePeer.
+// listen port, needed to configure the device via ConfigureWireguardDevice.
 func RequestPeerIpFromServer(
 	httpClient *http.Client,
 	serverIp netip.Addr,
@@ -493,27 +509,6 @@ func RemoveAddressFromInterface(ifname string, cidr netip.Prefix) {
 	if err := netlink.AddrDel(link(ifname), &netlink.Addr{IPNet: &ipnet}); err != nil {
 		log.Printf("warning: failed to remove old address from vprox interface when reconnecting: %v", err)
 	}
-}
-
-// ConfigurePeer configures the kernel WireGuard device from the server's
-// connect response.
-func ConfigurePeer(resp ConnectResponse, serverIp netip.Addr, privateKey Key, ifname string) error {
-	serverPublicKey, err := ParseKey(resp.ServerPublicKey)
-	if err != nil {
-		return fmt.Errorf("failed to parse server public key: %v", err)
-	}
-	err = ConfigureWireguardDevice(
-		ifname,
-		privateKey,
-		serverPublicKey,
-		serverIp.AsSlice(),
-		resp.ServerListenPort,
-		KeepaliveInterval,
-	)
-	if err != nil {
-		return fmt.Errorf("error configuring wireguard interface: %v", err)
-	}
-	return nil
 }
 
 // sendConnectRequest POSTs /connect to the server, authenticating with
