@@ -74,6 +74,8 @@ type Server struct {
 	// WgClient is a shared client for interacting with the WireGuard kernel module.
 	WgClient *wgctrl.Client
 
+	configureWireGuard func(wgtypes.Config) error
+
 	// WgCidr is the CIDR block of IPs that the server assigns to WireGuard peers.
 	WgCidr netip.Prefix
 
@@ -217,9 +219,11 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Keep peer lookup, allocation, WireGuard configuration, and ownership update
+	// in one critical section. Otherwise overlapping requests for the same key
+	// can reserve different addresses and leave the allocator/map/device split.
 	srv.mu.Lock()
 	peerInfo, exists := srv.allPeers[peerKey]
-	srv.mu.Unlock()
 
 	// If the new connection already exists as a peer, just return that IP.
 	var peerIp netip.Addr
@@ -231,22 +235,16 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if peerIp.IsUnspecified() {
+		srv.mu.Unlock()
 		log.Printf("no more ip addresses available in %v", srv.WgCidr)
 		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
 		return
 	}
 
-	srv.mu.Lock()
-	srv.allPeers[peerKey] = PeerInfo{
-		ConnectionTime: time.Now(),
-		PeerIp:         peerIp,
-	}
-	srv.mu.Unlock()
-
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
 	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
 	tWg := time.Now()
-	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
+	config := wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{
 			{
 				PublicKey:         peerKey,
@@ -254,18 +252,27 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 				AllowedIPs:        []net.IPNet{prefixToIPNet(netip.PrefixFrom(peerIp, 32))},
 			},
 		},
-	})
+	}
+	if srv.configureWireGuard != nil {
+		err = srv.configureWireGuard(config)
+	} else {
+		err = srv.WgClient.ConfigureDevice(srv.Ifname(), config)
+	}
 	MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:add_peer")
 	if err != nil {
-		srv.mu.Lock()
-		delete(srv.allPeers, peerKey)
+		if !exists {
+			srv.ipAllocator.Free(peerIp)
+		}
 		srv.mu.Unlock()
-
-		srv.ipAllocator.Free(peerIp)
 		log.Printf("failed to configure WireGuard peer: %v", err)
 		http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
 		return
 	}
+	srv.allPeers[peerKey] = PeerInfo{
+		ConnectionTime: time.Now(),
+		PeerIp:         peerIp,
+	}
+	srv.mu.Unlock()
 
 	// Return the assigned IP address and the server's public key.
 	resp := &connectResponse{
