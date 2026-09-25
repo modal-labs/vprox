@@ -16,6 +16,7 @@ import (
 type ServerInfo struct {
 	i      uint16
 	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // ServerManager handles creating and terminating servers on ips
@@ -30,6 +31,10 @@ type ServerManager struct {
 	wgBlock       netip.Prefix
 	wgBlockPerIp  uint
 	activeServers map[netip.Addr]ServerInfo
+
+	// These hooks keep the asynchronous lifecycle testable without system networking.
+	initializeServer func(*Server) error
+	serveServer      func(*Server) error
 
 	// freeIndices and nextFreeIndex together track usage of the range 0..numWgBlocks
 	freeIndices   []uint16 // stack of indices that are free
@@ -101,6 +106,10 @@ func (sm *ServerManager) freeIndex(i uint16) {
 
 // Start creates a new server on the specified ip.
 func (sm *ServerManager) Start(ip netip.Addr) error {
+	if _, ok := sm.activeServers[ip]; ok {
+		return fmt.Errorf("server already active at %v", ip)
+	}
+
 	i, err := sm.allocateIndex()
 	if err != nil {
 		return err
@@ -121,16 +130,29 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		Ctx:      subctx,
 		takeover: sm.takeover,
 	}
-	if err := srv.InitState(); err != nil {
-		_ = cancel // cancel should be discarded
+	initialize := srv.InitState
+	if sm.initializeServer != nil {
+		initialize = func() error { return sm.initializeServer(srv) }
+	}
+	if err := initialize(); err != nil {
+		cancel()
 		sm.freeIndex(i)
 		return err
 	}
 
+	done := make(chan struct{})
+	sm.activeServers[ip] = ServerInfo{i, cancel, done}
 	sm.waitGroup.Add(1)
 	go func() {
 		defer sm.waitGroup.Done()
-		defer sm.freeIndex(i)
+		defer close(done)
+		defer cancel()
+		if sm.serveServer != nil {
+			if err := sm.serveServer(srv); err != nil {
+				log.Printf("[%v] server failed: %v", ip, err)
+			}
+			return
+		}
 
 		if err := srv.StartWireguard(); err != nil {
 			log.Printf("[%v] failed to start WireGuard: %v", ip, err)
@@ -149,9 +171,24 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 			return
 		}
 	}()
-
-	sm.activeServers[ip] = ServerInfo{i, cancel}
 	return nil
+}
+
+// ReapFinished removes completed servers and releases their indices.
+// ServerManager methods must be called serially, including this method.
+func (sm *ServerManager) ReapFinished() []netip.Addr {
+	var finished []netip.Addr
+	for ip, server := range sm.activeServers {
+		select {
+		case <-server.done:
+			delete(sm.activeServers, ip)
+			server.cancel()
+			sm.freeIndex(server.i)
+			finished = append(finished, ip)
+		default:
+		}
+	}
+	return finished
 }
 
 // Wait blocks until the running servers exit.

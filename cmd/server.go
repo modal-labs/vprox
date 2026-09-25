@@ -151,7 +151,21 @@ func parseIpSet(ipStrs []string) (ipSet, error) {
 
 // pollAws gets the current set of IP associations from AWS and starts/stops the
 // server for those IPs.
-func pollAws(awsClient *lib.AwsMetadata, currentIps ipSet, sm *lib.ServerManager) (ipSet, error) {
+type awsAddressSource interface {
+	GetAddresses() ([]lib.AwsInterface, error)
+}
+
+type managedServers interface {
+	Start(netip.Addr) error
+	Stop(netip.Addr)
+	ReapFinished() []netip.Addr
+}
+
+func pollAws(awsClient awsAddressSource, currentIps ipSet, sm managedServers) (ipSet, error) {
+	for _, ip := range sm.ReapFinished() {
+		delete(currentIps, ip)
+	}
+
 	interfaces, err := awsClient.GetAddresses()
 
 	if err != nil {
