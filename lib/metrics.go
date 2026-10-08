@@ -3,7 +3,6 @@ package lib
 import (
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,9 +37,10 @@ var (
 	})
 )
 
-// StartMetricsServer starts an HTTP server on :9090 serving Prometheus metrics.
-// CPU and network bandwidth metrics are expected from the host-level Vector/DD agent.
-func StartMetricsServer() {
+// startMetricsServer serves Prometheus metrics over HTTP on :9090 in a
+// background goroutine. CPU and network bandwidth metrics are expected from
+// the host-level Vector/DD agent.
+func startMetricsServer() {
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
@@ -51,39 +51,36 @@ func StartMetricsServer() {
 	}()
 }
 
-func MetricsIncr(name string, tags ...string) {
-	switch name {
-	case "connect.count":
-		connectCount.Inc()
-	case "disconnect.count":
-		disconnectCount.Inc()
-	}
+func recordConnectRequest() {
+	connectCount.Inc()
 }
 
-// MetricsTiming records a latency observation in milliseconds.
-func MetricsTiming(name string, d time.Duration, tags ...string) {
-	ms := float64(d.Microseconds()) / 1000.0
-	switch name {
-	case "connect.server_side_latency_ms":
-		connectLatency.Observe(ms)
-	case "disconnect.server_side_latency_ms":
-		disconnectLatency.Observe(ms)
-	case "wg_configure.latency_ms":
-		operation := "unknown"
-		for _, t := range tags {
-			if k, v, ok := strings.Cut(t, ":"); ok && k == "operation" {
-				operation = v
-			}
-		}
-		wgConfigureLatency.WithLabelValues(operation).Observe(ms)
-	}
+func recordConnectLatency(duration time.Duration) {
+	connectLatency.Observe(durationToMillis(duration))
 }
 
-func MetricsGauge(name string, value float64, tags ...string) {
-	switch name {
-	case "active_peers":
-		activePeersGauge.Set(value)
-	case "allocated_ips":
-		allocatedIpsGauge.Set(value)
-	}
+func recordDisconnectRequest() {
+	disconnectCount.Inc()
+}
+
+func recordDisconnectLatency(duration time.Duration) {
+	disconnectLatency.Observe(durationToMillis(duration))
+}
+
+// recordWireguardConfigureLatency records how long one WireGuard device
+// configuration call took, labeled by the kind of operation performed.
+func recordWireguardConfigureLatency(operation string, duration time.Duration) {
+	wgConfigureLatency.WithLabelValues(operation).Observe(durationToMillis(duration))
+}
+
+func setActivePeersGauge(activePeerCount int) {
+	activePeersGauge.Set(float64(activePeerCount))
+}
+
+func setAllocatedIpsGauge(allocatedIpCount int) {
+	allocatedIpsGauge.Set(float64(allocatedIpCount))
+}
+
+func durationToMillis(duration time.Duration) float64 {
+	return float64(duration.Microseconds()) / 1000.0
 }
