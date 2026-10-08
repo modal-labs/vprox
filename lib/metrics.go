@@ -37,7 +37,7 @@ var (
 	})
 )
 
-// startMetricsServer serves Prometheus metrics over HTTP on :9090 in a
+// startMetricsServer serves Prometheus metrics over HTTP on port 9090 in a
 // background goroutine. CPU and network bandwidth metrics are expected from
 // the host-level Vector/DD agent.
 func startMetricsServer() {
