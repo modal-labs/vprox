@@ -14,10 +14,9 @@ import (
 // prefixToIPNet converts a netip.Prefix to a net.IPNet.
 func prefixToIPNet(prefix netip.Prefix) net.IPNet {
 	ip := net.IP(prefix.Addr().AsSlice())
-	ones := prefix.Bits()
 	return net.IPNet{
 		IP:   ip,
-		Mask: net.CIDRMask(ones, len(ip)*8),
+		Mask: net.CIDRMask(prefix.Bits(), len(ip)*8),
 	}
 }
 
@@ -26,7 +25,8 @@ func addrToIp(addr netip.Addr) net.IP {
 	return net.IP(addr.AsSlice())
 }
 
-// getDefaultInterface returns the default network interface.
+// getDefaultInterface returns the network interface that the default route
+// points at.
 func getDefaultInterface() (netlink.Link, error) {
 	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
 	if err != nil {
@@ -35,7 +35,6 @@ func getDefaultInterface() (netlink.Link, error) {
 
 	for _, route := range routes {
 		if route.Dst == nil || route.Dst.IP.Equal(net.IPv4zero) {
-			// Get the link (network interface) associated with the route
 			return netlink.LinkByIndex(route.LinkIndex)
 		}
 	}
@@ -43,97 +42,87 @@ func getDefaultInterface() (netlink.Link, error) {
 	return nil, fmt.Errorf("failed to find default route")
 }
 
-// IpAllocator is a simple IP address allocator that produces IP addresses
-// within a prefix, in increasing order of available IPs.
-//
-// All operations on an IpAllocator are thread-safe.
+// IpAllocator is the set of addresses handed out from one prefix. It hands out
+// the lowest free address first. All operations are safe for concurrent use.
 type IpAllocator struct {
-	mu             sync.Mutex // Protects the fields below
-	prefix         netip.Prefix
-	allocated      map[netip.Addr]struct{}
-	// allocatedCount equals len(allocated); allows lock-free reads for monitoring.
+	// mu protects prefix and allocated.
+	mu        sync.Mutex
+	prefix    netip.Prefix
+	allocated map[netip.Addr]struct{}
+
+	// allocatedCount mirrors len(allocated) so that it can be read without the lock.
 	allocatedCount atomic.Int64
 }
 
-// NewIpAllocator creates a new IpAllocator for the given prefix.
-//
-// The prefix is masked out to normalize its address at the beginning of the IP
-// range. It must be valid.
+// NewIpAllocator returns an empty IpAllocator for the masked form of prefix.
 func NewIpAllocator(prefix netip.Prefix) *IpAllocator {
-	ipa := new(IpAllocator)
-	ipa.prefix = prefix.Masked()
-	ipa.allocated = make(map[netip.Addr]struct{})
-	return ipa
+	return &IpAllocator{
+		prefix:    prefix.Masked(),
+		allocated: make(map[netip.Addr]struct{}),
+	}
 }
 
-// Allocate returns the next available IP address in the prefix.
-//
-// This never uses the initial address (the "zero address") of the prefix. For
-// example, for the prefix `192.168.0.0/24`, the first IP address allocated
-// will be `192.168.0.1`.
-//
-// If there are no more available IP addresses, this returns the zero address.
-func (ipa *IpAllocator) Allocate() netip.Addr {
-	ipa.mu.Lock()
-	defer ipa.mu.Unlock()
+// Allocate marks the lowest free address in the prefix as allocated and
+// returns it. The prefix's network address is never handed out, so the first
+// address allocated from 192.168.0.0/24 is 192.168.0.1. Returns the
+// unspecified address if the prefix is exhausted.
+func (allocator *IpAllocator) Allocate() netip.Addr {
+	allocator.mu.Lock()
+	defer allocator.mu.Unlock()
 
-	addr := ipa.prefix.Addr().Next()
-	for ipa.prefix.Contains(addr) && !addr.IsUnspecified() {
-		if _, ok := ipa.allocated[addr]; !ok {
-			ipa.allocated[addr] = struct{}{}
-			ipa.allocatedCount.Add(1)
+	addr := allocator.prefix.Addr().Next()
+	for allocator.prefix.Contains(addr) && !addr.IsUnspecified() {
+		if _, ok := allocator.allocated[addr]; !ok {
+			allocator.allocated[addr] = struct{}{}
+			allocator.allocatedCount.Add(1)
 			return addr
 		}
 		addr = addr.Next()
 	}
 
-	// Otherwise, return the zero address.
-	if ipa.prefix.Addr().Is4() {
+	if allocator.prefix.Addr().Is4() {
 		return netip.AddrFrom4([4]byte{})
-	} else {
-		return netip.AddrFrom16([16]byte{})
 	}
+	return netip.AddrFrom16([16]byte{})
 }
 
-// Free marks the given IP address as available for allocation.
-func (ipa *IpAllocator) Free(addr netip.Addr) bool {
-	ipa.mu.Lock()
-	defer ipa.mu.Unlock()
+// Free marks addr as available again and reports whether it was allocated.
+func (allocator *IpAllocator) Free(addr netip.Addr) bool {
+	allocator.mu.Lock()
+	defer allocator.mu.Unlock()
 
-	if _, ok := ipa.allocated[addr]; ok {
-		delete(ipa.allocated, addr)
-		ipa.allocatedCount.Add(-1)
+	if _, ok := allocator.allocated[addr]; ok {
+		delete(allocator.allocated, addr)
+		allocator.allocatedCount.Add(-1)
 		return true
 	}
 	return false
 }
 
-// AllocatedCount returns the number of currently allocated IP addresses.
-func (ipa *IpAllocator) AllocatedCount() int {
-	return int(ipa.allocatedCount.Load())
+// AllocatedCount returns the number of currently allocated addresses.
+func (allocator *IpAllocator) AllocatedCount() int {
+	return int(allocator.allocatedCount.Load())
 }
 
-// MarkAllocated marks the given IP as allocated without going through the normal
-// allocation sequence. Used for takeover mode to mark IPs that are already in use
-// by existing WireGuard peers.
-func (ipa *IpAllocator) MarkAllocated(addr netip.Addr) {
-	ipa.mu.Lock()
-	defer ipa.mu.Unlock()
+// MarkAllocated marks addr as allocated if it is inside the prefix and not
+// already allocated.
+func (allocator *IpAllocator) MarkAllocated(addr netip.Addr) {
+	allocator.mu.Lock()
+	defer allocator.mu.Unlock()
 
-	if !ipa.prefix.Contains(addr) {
-		return // not in prefix
+	if !allocator.prefix.Contains(addr) {
+		return
 	}
-	if _, ok := ipa.allocated[addr]; ok {
-		return // already allocated; do nothing
+	if _, ok := allocator.allocated[addr]; ok {
+		return
 	}
-	ipa.allocated[addr] = struct{}{}
-	ipa.allocatedCount.Add(1)
+	allocator.allocated[addr] = struct{}{}
+	allocator.allocatedCount.Add(1)
 }
 
-// AfterCountIpBlock returns the result of incrementing an IP address by N CIDR
-// counts.
+// AfterCountIpBlock returns ip advanced by count blocks of prefix length size.
+// For example, 10.0.0.0 advanced by 2 blocks of size 24 is 10.0.2.0.
 func AfterCountIpBlock(ip netip.Addr, size uint, count uint) netip.Addr {
-	// Copy the IP address to avoid modifying the original.
 	ipBytes := ip.As4()
 
 	bits := 8 * uint(len(ipBytes))
@@ -141,19 +130,17 @@ func AfterCountIpBlock(ip netip.Addr, size uint, count uint) netip.Addr {
 		log.Panicf("block size of %v is larger than ip bits %v", size, bits)
 	}
 
-	// CIDR block size rounded up to the nearest multiple of 8
-	// 32->32, 31->32, 30->32, ..., 25->32, 24->24
-	tSize := 8 * ((size + 7) / 8)
-	tCount := count << (tSize - size)
-	for ; tSize > 0; tSize -= 8 {
-		c := tCount & 0xff // how much to add to the current byte
-		tCount = tCount >> 8
-		// 1.2.3.4/32 (byteIndex = 3) -> 1.2.3.5/32
-		// 1.2.3.4/24 (byteIndex = 2) -> 1.2.4.4/24
-		byteIndex := tSize/8 - 1
-		addWithCarry := uint(ipBytes[byteIndex]) + c
-		ipBytes[byteIndex] = byte(addWithCarry)
-		tCount += addWithCarry >> 8
+	// Round the block size up to a whole number of bytes and scale the count to match so that
+	// the addition can proceed one byte at a time from the least significant byte.
+	roundedSize := 8 * ((size + 7) / 8)
+	remainingCount := count << (roundedSize - size)
+	for ; roundedSize > 0; roundedSize -= 8 {
+		byteIncrement := remainingCount & 0xff
+		remainingCount = remainingCount >> 8
+		byteIndex := roundedSize/8 - 1
+		sumWithCarry := uint(ipBytes[byteIndex]) + byteIncrement
+		ipBytes[byteIndex] = byte(sumWithCarry)
+		remainingCount += sumWithCarry >> 8
 	}
 
 	return netip.AddrFrom4(ipBytes)
