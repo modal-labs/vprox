@@ -181,6 +181,12 @@ type connectResponse struct {
 	AssignedAddr     string
 	ServerPublicKey  string
 	ServerListenPort int
+
+	// ExistingPeer is true when the server already had this peer, so its
+	// WireGuard peer was updated in place and any session with the client
+	// is still valid. A client may then keep its own session instead of
+	// starting a new handshake.
+	ExistingPeer bool
 }
 
 // Handle a new connection.
@@ -272,6 +278,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		AssignedAddr:     fmt.Sprintf("%v/%d", peerIp, srv.WgCidr.Bits()),
 		ServerPublicKey:  srv.Key.PublicKey().String(),
 		ServerListenPort: WireguardListenPortBase + int(srv.Index),
+		ExistingPeer:     exists,
 	}
 
 	respBuf, err := json.Marshal(resp)
