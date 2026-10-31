@@ -509,26 +509,16 @@ func (srv *Server) CleanupWireguard() {
 	}
 }
 
-// iptablesInputFwmarkRule adds or removes the mangle PREROUTING rule for traffic from WireGuard.
-func (srv *Server) iptablesInputFwmarkRule(enabled bool) error {
-	firewallMark := FwmarkBase + int(srv.Index)
-	rule := []string{
-		"-i", srv.Ifname(),
-		"-j", "MARK", "--set-mark", strconv.Itoa(firewallMark),
-		"-m", "comment", "--comment", fmt.Sprintf("vprox fwmark rule for %s", srv.Ifname()),
-	}
-	if enabled {
-		return srv.Ipt.AppendUnique("mangle", "PREROUTING", rule...)
-	} else {
-		return srv.Ipt.Delete("mangle", "PREROUTING", rule...)
-	}
-}
-
 // iptablesSnatRule adds or removes the nat POSTROUTING rule for outbound traffic.
+//
+// The rule matches peer addresses leaving the bind interface. nat rules run only
+// for the first packet of a connection, so later packets skip this check. The
+// -o match keeps the server's own replies to peers, which leave the WireGuard
+// interface from the server's peer address, out of the translation.
 func (srv *Server) iptablesSnatRule(enabled bool) error {
-	firewallMark := FwmarkBase + int(srv.Index)
 	rule := []string{
-		"-m", "mark", "--mark", strconv.Itoa(firewallMark),
+		"-s", srv.WgCidr.Masked().String(),
+		"-o", srv.BindIface.Attrs().Name,
 		"-j", "SNAT", "--to-source", srv.BindAddr.String(),
 		"-m", "comment", "--comment", fmt.Sprintf("vprox snat rule for %s", srv.Ifname()),
 	}
@@ -536,6 +526,30 @@ func (srv *Server) iptablesSnatRule(enabled bool) error {
 		return srv.Ipt.AppendUnique("nat", "POSTROUTING", rule...)
 	} else {
 		return srv.Ipt.Delete("nat", "POSTROUTING", rule...)
+	}
+}
+
+// deleteFwmarkRules deletes the mangle rule that marks every packet from the
+// WireGuard interface and the nat rule that translates marked packets. A server
+// that this process takes over may have installed them. Missing rules are not
+// an error.
+func (srv *Server) deleteFwmarkRules() {
+	firewallMark := strconv.Itoa(FwmarkBase + int(srv.Index))
+	markRule := []string{
+		"-i", srv.Ifname(),
+		"-j", "MARK", "--set-mark", firewallMark,
+		"-m", "comment", "--comment", fmt.Sprintf("vprox fwmark rule for %s", srv.Ifname()),
+	}
+	markSnatRule := []string{
+		"-m", "mark", "--mark", firewallMark,
+		"-j", "SNAT", "--to-source", srv.BindAddr.String(),
+		"-m", "comment", "--comment", fmt.Sprintf("vprox snat rule for %s", srv.Ifname()),
+	}
+	if err := srv.Ipt.DeleteIfExists("mangle", "PREROUTING", markRule...); err != nil {
+		log.Printf("warning: failed to delete fwmark rule: %v\n", err)
+	}
+	if err := srv.Ipt.DeleteIfExists("nat", "POSTROUTING", markSnatRule...); err != nil {
+		log.Printf("warning: failed to delete fwmark SNAT rule: %v\n", err)
 	}
 }
 
@@ -557,21 +571,17 @@ func (srv *Server) iptablesMssRule(enabled bool) error {
 }
 
 func (srv *Server) StartIptables() error {
-	err := srv.iptablesInputFwmarkRule(true)
+	err := srv.iptablesSnatRule(true)
 	if err != nil {
-		return fmt.Errorf("failed to add fwmark rule: %v", err)
-	}
-
-	err = srv.iptablesSnatRule(true)
-	if err != nil {
-		srv.iptablesInputFwmarkRule(false)
 		return fmt.Errorf("failed to add SNAT rule: %v", err)
 	}
+	// Delete only after the new SNAT rule is in place, so peer traffic is
+	// always translated.
+	srv.deleteFwmarkRules()
 
 	err = srv.iptablesMssRule(true)
 	if err != nil {
 		srv.iptablesSnatRule(false)
-		srv.iptablesInputFwmarkRule(false)
 		return fmt.Errorf("failed to add MSS rule: %v", err)
 	}
 
@@ -579,9 +589,7 @@ func (srv *Server) StartIptables() error {
 }
 
 func (srv *Server) CleanupIptables() {
-	if err := srv.iptablesInputFwmarkRule(false); err != nil {
-		log.Printf("warning: error cleaning up IP tables: failed to add fwmark rule: %v\n", err)
-	}
+	srv.deleteFwmarkRules()
 	if err := srv.iptablesSnatRule(false); err != nil {
 		log.Printf("warning: error cleaning up IP tables: failed to add SNAT rule: %v\n", err)
 	}
