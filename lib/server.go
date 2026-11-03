@@ -448,7 +448,7 @@ func (srv *Server) StartWireguard() error {
 		}
 	} else {
 		// Normal mode: delete and recreate the interface
-		_ = netlink.LinkDel(link) // remove if it already exists
+		srv.deleteWireguardDevice(link) // remove if it already exists
 		if err := srv.createFreshInterface(link); err != nil {
 			return err
 		}
@@ -504,8 +504,26 @@ func (srv *Server) CleanupWireguard() {
 		log.Printf("[%v] skipping WireGuard cleanup (relinquished)", srv.BindAddr)
 	} else {
 		log.Printf("[%v] cleaning up WireGuard state", srv.BindAddr)
-		ifname := srv.Ifname()
-		_ = netlink.LinkDel(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}})
+		srv.deleteWireguardDevice(&linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: srv.Ifname()}})
+	}
+}
+
+// deleteWireguardDevice removes all peers in one call, then deletes the device if it exists.
+//
+// The kernel tears down the peers of a deleted device one at a time, about 50 ms each, which is
+// minutes for thousands of peers. Removing them all in one call takes milliseconds.
+func (srv *Server) deleteWireguardDevice(link *linkWireguard) {
+	if _, err := netlink.LinkByName(link.Name); err != nil {
+		return
+	}
+	tWg := time.Now()
+	err := srv.WgClient.ConfigureDevice(link.Name, wgtypes.Config{ReplacePeers: true})
+	MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:remove_all_peers")
+	if err != nil {
+		log.Printf("[%v] failed to remove peers from %s before deleting it: %v", srv.BindAddr, link.Name, err)
+	}
+	if err := netlink.LinkDel(link); err != nil {
+		log.Printf("[%v] failed to delete WireGuard device %s: %v", srv.BindAddr, link.Name, err)
 	}
 }
 
