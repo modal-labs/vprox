@@ -517,9 +517,12 @@ func (srv *Server) deleteWireguardDevice(link *linkWireguard) {
 	// deleted device's peers one at a time at about 50 ms each.
 	tWg := time.Now()
 	err := srv.WgClient.ConfigureDevice(link.Name, wgtypes.Config{ReplacePeers: true})
-	MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:remove_all_peers")
+	removeDuration := time.Since(tWg)
+	MetricsTiming("wg_configure.latency_ms", removeDuration, "operation:remove_all_peers")
 	if err != nil {
 		log.Printf("[%v] failed to remove peers from %s before deleting it: %v", srv.BindAddr, link.Name, err)
+	} else {
+		log.Printf("[%v] removed all peers from %s in %v", srv.BindAddr, link.Name, removeDuration)
 	}
 	if err := netlink.LinkDel(link); err != nil {
 		log.Printf("[%v] failed to delete WireGuard device %s: %v", srv.BindAddr, link.Name, err)
