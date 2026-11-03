@@ -508,14 +508,13 @@ func (srv *Server) CleanupWireguard() {
 	}
 }
 
-// deleteWireguardDevice removes all peers in one call, then deletes the device if it exists.
-//
-// The kernel tears down the peers of a deleted device one at a time, about 50 ms each, which is
-// minutes for thousands of peers. Removing them all in one call takes milliseconds.
+// deleteWireguardDevice removes all peers from the device, then deletes it if it exists.
 func (srv *Server) deleteWireguardDevice(link *linkWireguard) {
 	if _, err := netlink.LinkByName(link.Name); err != nil {
 		return
 	}
+	// Remove every peer in one call before deleting the device, because the kernel tears down a
+	// deleted device's peers one at a time at about 50 ms each.
 	tWg := time.Now()
 	err := srv.WgClient.ConfigureDevice(link.Name, wgtypes.Config{ReplacePeers: true})
 	MetricsTiming("wg_configure.latency_ms", time.Since(tWg), "operation:remove_all_peers")
